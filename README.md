@@ -28,6 +28,25 @@
 tasks for learning agents. Its primary purpose is to act as a testbed for
 research in artificial intelligence, especially deep reinforcement learning.
 
+## VLR Modifications
+Run basic, single-room environment in human control mode
+while visualizing a subset of the available objects.
+
+```
+bazel run :game -- -l vlr_env1 -s logToStdErr=true
+```
+
+We can make different copies of that file to 
+represent different "levels". See ```game_scripts/levels/vlr_env1.lua```
+
+
+File with many of the available objects:<br>
+```deepmind-lab/game_scripts/common/vlr_objects.lua```
+
+
+
+
+
 ## About
 
 Disclaimer: This is not an official Google product.
