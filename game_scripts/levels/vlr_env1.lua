@@ -23,15 +23,49 @@ local timeout = require 'decorators.timeout'
 local api = {}
 
 local MAP_ENTITIES = [[
-*******************
-*           P      *
-*  K L M N        *
-*  A B C D E      *
-*  F G H I J      *
-*  O  Q R S      *
-*  T U V W X Y Z  *
-*******************
+-- *******************
+-- *           P      *
+-- *  K L M N        *
+-- *  A B C D E      *
+-- *  F G H I J      *
+-- *  O  Q R S      *
+-- *  T U V W X Y Z  *
+-- *******************
+-- ]]
+
+******************************
+*   R    U  Z   Y  W    M Q  *
+*    J R Q X O   S W   M     *
+*    B  F         X  U R   Y *
+*   Q A A H X W  H K  W   F  *
+*      I        L    Q  J  O *
+*   T   S L  M N F V         *
+*    I Q N V       T F   Z D *
+* U M  C  J   T   F    I   V *
+*  M R    W  S       C   X   *
+* L E   O       Q   I R      *
+* S   X F   N X  O  Q  C I   *
+*   F G   M  S          E  Z *
+*   D    L J   L  T C C   L  *
+*  W  A    Y  L     E F      *
+* F    R  Q  I  A   N U B    *
+* G   G N  Q K A      O      *
+* F        R   H  R   H   H  *
+*    A C  G Z  H   T X  O    *
+*   Z I       D B   T   L    *
+*       J    H  O D     Y  A *
+* H  F      S      L   O X   *
+*  Y         B  X H W O    C *
+*    F     I    U   N        *
+* A     M   M    C R   K   Z *
+*    O  Z     O D M  W  U R  *
+* I   I   Z  L  V M A G B X  *
+*  A    B     E Y   R X      *
+*   S   D Y J  S  D          *
+******************************
 ]]
+
+
 
 function api:init(params)
   make_map.seedRng(1)
