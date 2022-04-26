@@ -73,17 +73,19 @@ class PretrainedVisionTask(object):
     # 2. randomly sample pairs of images from entire buffer
     # objects are always spinning, so taking two images, we can use the motion
     # to get a segmentation mask and use Deepak's "Learning Features by Watching Objects Move"
-    def __init__(self, device, lr=0.001, n_epochs=10, batch_size=32, buffer_size=200):
-        self.model = models.resnet18(pretrained=True)
-        self.model.fc = nn.Linear(512, 512)
+    def __init__(self, device, lr=0.001, n_epochs=10, batch_size=16, buffer_size=200):
         self.lr = lr
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.buffer_size = buffer_size
-        self.model = self.model.to(device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.buffer = []
         self.buffer_idx = 0
+
+        # NOTE: Tune ALL parameters of network, DON'T FREEZE BACKBONE
+        self.model = models.resnet18(pretrained=True)
+        self.model.fc = nn.Linear(512, 512)
+        self.model = self.model.to(device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
     def add_to_buffer(self, entry):
         """
@@ -110,13 +112,13 @@ class PretrainedVisionTask(object):
             pass
 
         else:
-            ipdb.set_trace()
             buffer_entries = torch.stack(random.sample(self.buffer, self.batch_size))  # default replace=False
             buffer_feats = self.model(buffer_entries)
-            inp_feat = self.model(inp)
+            inp_feat = self.model(inp.unsqueeze(0))
 
             # Loss: cosine similarity, want to minimize similarity
-            loss = -torch.mean(torch.sum(inp_feat * buffer_feats, dim=1))
+            loss = torch.mean(torch.sum(inp_feat * buffer_feats, dim=1))
+            print("Contrastive loss:", loss.item())
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -221,8 +223,9 @@ class RNDExplorer(Explorer):
         super().__init__(*args, **kwargs)
         self.lr = 1e-3
         self.rollout_horizon = 16
+        self.top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
         self.n_train = 10
-        self.eps = 0.0  # p(random action)
+        self.eps = 0.2  # p(random action)
         self.step = 0
 
         # only add "interesting" images to vision task after at least 1 update of RND networks
@@ -239,7 +242,7 @@ class RNDExplorer(Explorer):
         self.optimizer = None
         self.reset_model_weights()
 
-        self.avg_intrinsic_reward = utils.AverageMeter()
+        # self.avg_intrinsic_reward = utils.AverageMeter()
 
     def reset_model_weights(self):
         # Reset predictor and target network final FC layer weights
@@ -288,27 +291,24 @@ class RNDExplorer(Explorer):
         action_distrib = intrinsic_reward / intrinsic_reward.sum()
         return intrinsic_reward, action_distrib, images
 
-    def should_train_im(self, intrinsic_reward: np.ndarray):
-        """
-        Approach 1:
-            Calculate running mean of intrinsic reward
-            if intrinsic_reward > self.mean_intrinsic_reward:
-                return True
-            else:
-                return False
-        """
-        # TODO: Update mean before or after saving?
-        self.avg_intrinsic_reward.update(intrinsic_reward)
-        if self.step > self.min_steps_intrinsic_reward:
-            ipdb.set_trace()
-            return intrinsic_reward > self.avg_intrinsic_reward.avg
-        else:
-            return [False] * len(intrinsic_reward)
+    # def should_train_im(self, intrinsic_reward: np.ndarray):
+    #     """
+    #     Approach 1:
+    #         Calculate running mean of intrinsic reward
+    #         if intrinsic_reward > self.mean_intrinsic_reward:
+    #             return True
+    #         else:
+    #             return False
+    #     """
+    #     # TODO: Update mean before or after saving?
+    #     return intrinsic_reward > self.avg_intrinsic_reward.avg
 
     def rollout(self, env):
         # TODO: should replay buffer always use the forward-looking image, or
         #   rather pick all/random view(s) at each state?
         replay_buffer = [self.get_obs(env)]
+        all_rollout_images = []
+        all_rollout_intrinsic_rewards = np.array([])
 
         # Take actions while collecting images for RND training
         for k in range(self.rollout_horizon):
@@ -321,22 +321,14 @@ class RNDExplorer(Explorer):
                 # batch x output_feat -> batch x 1
                 intrinsic_reward, action_distrib, images = self.get_action_distrib(env)
 
-            # Save images if intrinsic reward is high enough and enough steps have passed (so mean has stabilized)
-            batch_should_train = self.should_train_im(intrinsic_reward)
-            for i, should_train in enumerate(batch_should_train):
-                if should_train:
-                    # TODO: always update with each interesting image? or update every n steps?
-                    self.vision_task.update(images[i])
-                    self.interesting_images.append(images[i])  # for visualization
-
             # TODO: epsilon greedy? or just sample from action distrib?
-            # if np.random.uniform() < self.eps:
-            #     # random action
-            #     action = np.random.choice(self.action_space)
-            # else:
-            #     # greedy action
-            #     action = np.argmax(self.action_space)
-            direction_action = np.random.choice(self.action_space, p=action_distrib)
+            if np.random.uniform() < self.eps:
+                # random action
+                direction_action = np.random.choice(self.action_space)
+            else:
+                # greedy action
+                direction_action = np.argmax(self.action_space)
+            # direction_action = np.random.choice(self.action_space, p=action_distrib)
 
             # cur_state_again = self.obs_to_im(self.get_obs(env))
             # plt.imshow(cur_state_again)
@@ -358,18 +350,27 @@ class RNDExplorer(Explorer):
                 break
 
             replay_buffer.append(self.get_obs(env))
+            all_rollout_images += images
+            all_rollout_intrinsic_rewards = np.append(all_rollout_intrinsic_rewards, intrinsic_reward)
 
-            images = [self.obs_to_im(obs) for obs in images]
-            self.all_images.append(images)
+            orig_images = [self.obs_to_im(obs) for obs in images]
+            self.all_images.append(orig_images)
             self.all_action_distribs.append(action_distrib)
             self.all_intrinsic_reward.append(intrinsic_reward)
             self.all_actions.append(direction_action)
+
             # try:
             #     plt.imshow(im)
             #     plt.draw()
             #     plt.pause(0.2)
             # except KeyboardInterrupt:
             #     exit()
+
+        # Save images if intrinsic reward is high enough and enough steps have passed (so mean has stabilized)
+        top_image_idxs = np.argsort(all_rollout_intrinsic_rewards)[-self.top_k:]
+        for im_idx in top_image_idxs:
+            self.vision_task.update(all_rollout_images[im_idx])
+            self.interesting_images.append(self.obs_to_im(all_rollout_images[im_idx]))  # for visualization
 
         return replay_buffer
 
@@ -425,7 +426,6 @@ class RandomExplorer(Explorer):
 
             if not env.is_running():
                 # Env stopped??? Why?
-                import ipdb
                 ipdb.set_trace()
                 break
 
