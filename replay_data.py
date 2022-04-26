@@ -20,7 +20,7 @@ intrinsic_rewards = np.load(f'{data_root}/all_intrinsic_reward.npy', allow_pickl
 interesting_images = np.load(f'{data_root}/interesting_images.npy', allow_pickle=True)
 num_actions = len(action_distribs[0])
 angles = (360 * np.arange(num_actions) / num_actions).astype(int)
-
+print(len(interesting_images))
 for i, im in enumerate(interesting_images):
     print("Image {}".format(i))
     plt.imshow(im)

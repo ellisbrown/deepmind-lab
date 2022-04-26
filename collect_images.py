@@ -6,8 +6,11 @@ import time
 import argparse
 from PIL import Image
 import matplotlib.pyplot as plt
+import signal
 
 import deepmind_lab
+
+from agent_random_distill import STEPS_TO_FULLY_ROTATE, LOOKAROUND_ACTION
 
 OBSERVATION_MODE = "DEBUG.CAMERA_INTERLEAVED.PLAYER_VIEW_NO_RETICLE"
 
@@ -22,6 +25,10 @@ ActionSpace = {
     'strafe_right': _action(0, 0, 1, 0, 0, 0, 0),
     'forward': _action(0, 0, 0, 1, 0, 0, 0),
     'backward': _action(0, 0, 0, -1, 0, 0, 0),
+    'noop': _action(0, 0, 0, 0, 0, 0, 0),
+      'fire': _action(0, 0, 0, 0, -1, 0, 0),
+      'jump': _action(0, 0, 0, 0, 0, 1, 0),
+      'crouch': _action(0, 0, 0, 0, 0, 0, 1)
 }
 
 def on_press(key):
@@ -89,7 +96,7 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     env = deepmind_lab.Lab(level, [OBSERVATION_MODE], config=config)
     env.reset()
 
-    img_dir = "boring_images"
+    img_dir = "test_obj_motion_images"
     images = []
     global is_capture, env_action, is_done
     is_capture = False
@@ -98,6 +105,13 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     listener = keyboard.Listener(
         on_press=on_press)
     listener.start()
+
+    def sigint_handler(signal, frame):
+        # Force scripts to exit cleanly
+        global is_done
+        is_done = True
+    signal.signal(signal.SIGINT, sigint_handler)
+
     while not is_done:
         image = env.observations()[OBSERVATION_MODE]
         try:
@@ -105,6 +119,16 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
             plt.draw()
             plt.pause(0.01)
             if is_capture:
+                # Wait for velocity to reach 0
+                for i in range(3 * STEPS_TO_FULLY_ROTATE):
+                    env.step(LOOKAROUND_ACTION)
+
+                env.step(ActionSpace['noop'], num_steps=3)
+                print("Capturing image")
+                image = env.observations()[OBSERVATION_MODE]
+                plt.imshow(image)
+                plt.draw()
+                plt.pause(0.01)
                 images.append(image)
                 is_capture = False
 
