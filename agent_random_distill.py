@@ -119,7 +119,7 @@ class PretrainedVisionTask(object):
 
             # Loss: cosine similarity, want to minimize similarity
             loss = torch.mean(torch.sum(inp_feat * buffer_feats, dim=1))
-            print("Contrastive loss:", loss.item())
+            # print("Contrastive loss:", loss.item())
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -130,7 +130,7 @@ class PretrainedVisionTask(object):
 
 
 class Explorer(object):
-    def __init__(self, device, vision_task: PretrainedVisionTask):
+    def __init__(self, device, save_freq, vision_task: PretrainedVisionTask):
         """
         :param device: torch.device
         :param vision_task: vision task to be trained on "interesting" images
@@ -139,6 +139,10 @@ class Explorer(object):
         super().__init__()
         self.device = device
         self.vision_task = vision_task
+        self.save_freq = save_freq  # save every N rollout_step's NOTE: (not steps)
+        now = datetime.now()
+        now_str = now.strftime("%Y_%m_%d_%H:%M:%S")
+        self.save_dir = "experiment_data/%s" % now_str
 
         # [0(initial view), 1, ... STEPS_TO_FULLY_ROTATE-1(final view before returning to inital view)]
         # takes STEPS_TO_FULLY_ROTATE to full rotate, so to avoid double-counting
@@ -203,20 +207,21 @@ class Explorer(object):
     def explore(self, env, n_steps):
         raise NotImplementedError("Base class")
 
-    def save_results(self):
-        now = datetime.now()
-        now_str = now.strftime("%Y_%m_%d_%H:%M:%S")
-        images_dir = "experiment_data/%s" % now_str
-        os.mkdir(images_dir)
-        np.save(f"{images_dir}/all_images.npy", self.all_images)
-        np.save(f"{images_dir}/all_action_distribs.npy", self.all_action_distribs)
-        np.save(f"{images_dir}/all_intrinsic_reward.npy", self.all_intrinsic_reward)
-        np.save(f"{images_dir}/all_actions.npy", self.all_actions)
-        np.save(f"{images_dir}/interesting_images.npy", self.interesting_images)
-        print("Saved to %s" % images_dir)
+    def save_results(self, rollout_step):
+        if not os.path.exists(self.save_dir):
+            os.mkdir(self.save_dir)
+        np.save(f"{self.save_dir}/all_images.npy", self.all_images)
+        np.save(f"{self.save_dir}/all_action_distribs.npy", self.all_action_distribs)
+        np.save(f"{self.save_dir}/all_intrinsic_reward.npy", self.all_intrinsic_reward)
+        np.save(f"{self.save_dir}/all_actions.npy", self.all_actions)
+        np.save(f"{self.save_dir}/interesting_images.npy", self.interesting_images)
+        print("Step %d Saved to %s" % (rollout_step, self.save_dir))
 
-        # Save pretrained vision model
-        torch.save(self.vision_task.model.state_dict(), f"{images_dir}/pretrained_vision_model.pt")
+        # Save pretrained vision model, don't save fc layer so when loading this model, must set fc to None
+        vision_model_state_dict = self.vision_task.model.state_dict()
+        vision_model_state_dict.pop('fc.weight', None)
+        vision_model_state_dict.pop('fc.bias', None)
+        torch.save(vision_model_state_dict, f"{self.save_dir}/pretrained_vision_model_step_{rollout_step}.pt")
 
 
 class RNDExplorer(Explorer):
@@ -361,20 +366,25 @@ class RNDExplorer(Explorer):
         self.get_surrounding_images(env)
         self.get_surrounding_images(env)
 
+        rollout_step = 0
         step = 0
         pbar = tqdm(total=n_steps)
         while step < n_steps:
             # NOTE: Reset Replay Buffer to only contain recently visited states
             replay_buffer = self.rollout(env)
             step += len(replay_buffer)
+            rollout_step += 1
             pbar.update(len(replay_buffer))
+
+            if rollout_step % self.save_freq == 0:
+                self.save_results(rollout_step)
 
             # Update Predictor Network n_train times using the same replay buffer
             batch_states = torch.stack(replay_buffer)
             init_loss, final_loss = self.update(batch_states)
             print("(%d) %.3f -> %.3f" % (step + 1, init_loss, final_loss))
 
-        self.save_results()
+        self.save_results(rollout_step)
 
 
 class RandomExplorer(Explorer):
@@ -413,13 +423,18 @@ class RandomExplorer(Explorer):
         self.get_surrounding_images(env)
         self.get_surrounding_images(env)
 
+        rollout_step = 0
         step = 0
         pbar = tqdm(total=n_steps)
         while step < n_steps:
             # NOTE: Reset Replay Buffer to only contain recently visited states
             replay_buffer = self.rollout(env)
             step += len(replay_buffer)
+            rollout_step += 1
             pbar.update(len(replay_buffer))
+
+            if rollout_step % self.save_freq == 0:
+                self.save_results(rollout_step)
 
             # Draw top_k images randomly to train vision task
             image_idxs = np.random.choice(len(replay_buffer), self.top_k)
@@ -427,7 +442,7 @@ class RandomExplorer(Explorer):
                 self.vision_task.update(replay_buffer[im_idx])
                 self.interesting_images.append(self.obs_to_im(replay_buffer[im_idx]))  # for visualization
 
-        self.save_results()
+        self.save_results(rollout_step)
 
 
 def run(length, width, height, fps, level, record, demo, demofiles, video):
@@ -481,13 +496,15 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     #     except KeyboardInterrupt:
     #         exit()
 
+    save_freq = 30
     rollout_horizon = 16
     top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
     use_ensemble = False
     vision_task = PretrainedVisionTask(device=DEVICE)
-    # explorer = RNDExplorer(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
-    #                        rollout_horizon=rollout_horizon, top_k=top_k)
-    explorer = RandomExplorer(device=DEVICE, vision_task=vision_task, rollout_horizon=rollout_horizon, top_k=top_k)
+    explorer = RNDExplorer(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
+                           rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq)
+    # explorer = RandomExplorer(device=DEVICE, vision_task=vision_task, rollout_horizon=rollout_horizon,
+    #                           top_k=top_k, save_freq=save_freq)
     explorer.explore(env, n_steps=length)
 
 
