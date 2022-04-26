@@ -130,16 +130,14 @@ class PretrainedVisionTask(object):
 
 
 class Explorer(object):
-    def __init__(self, device, use_ensemble, vision_task: PretrainedVisionTask):
+    def __init__(self, device, vision_task: PretrainedVisionTask):
         """
         :param device: torch.device
-        :param use_ensemble: bool
         :param vision_task: vision task to be trained on "interesting" images
             through the exploration process
         """
         super().__init__()
         self.device = device
-        self.use_ensemble = use_ensemble
         self.vision_task = vision_task
 
         # [0(initial view), 1, ... STEPS_TO_FULLY_ROTATE-1(final view before returning to inital view)]
@@ -216,15 +214,18 @@ class Explorer(object):
         np.save(f"{images_dir}/all_actions.npy", self.all_actions)
         np.save(f"{images_dir}/interesting_images.npy", self.interesting_images)
         print("Saved to %s" % images_dir)
-        return
+
+        # Save pretrained vision model
+        torch.save(self.vision_task.model.state_dict(), f"{images_dir}/pretrained_vision_model.pt")
 
 
 class RNDExplorer(Explorer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, use_ensemble, rollout_horizon, top_k, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.use_ensemble = use_ensemble
+        self.rollout_horizon = rollout_horizon
+        self.top_k = top_k  # top_k / rollout_horizon = fraction of images to use for vision task
         self.lr = 1e-3
-        self.rollout_horizon = 16
-        self.top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
         self.n_train = 10
         self.eps = 0.2  # p(random action)
         self.step = 0
@@ -240,20 +241,11 @@ class RNDExplorer(Explorer):
         for param in self.predictor.parameters():
             param.requires_grad = False
         # NOTE: define model.fc AFTER so only fc has requires_grad=True
-        self.optimizer = None
-        self.reset_model_weights()
-
-        # self.avg_intrinsic_reward = utils.AverageMeter()
-
-    def reset_model_weights(self):
-        # Reset predictor and target network final FC layer weights
-        # Freeze all target network weights
         if self.use_ensemble:
             pass
-
         else:
-            self.target.fc = nn.Linear(512, self.num_actions).to(self.device)
-            self.predictor.fc = nn.Linear(512, self.num_actions).to(self.device)
+            self.target.fc = nn.Linear(512, 128).to(self.device)
+            self.predictor.fc = nn.Linear(512, 128).to(self.device)
         params_to_update = []
         for p in self.predictor.parameters():
             if p.requires_grad == True:  # only fc params will have requires_grad=True
@@ -291,18 +283,6 @@ class RNDExplorer(Explorer):
         intrinsic_reward = intrinsic_reward.detach().cpu().numpy().flatten()
         action_distrib = intrinsic_reward / intrinsic_reward.sum()
         return intrinsic_reward, action_distrib, images
-
-    # def should_train_im(self, intrinsic_reward: np.ndarray):
-    #     """
-    #     Approach 1:
-    #         Calculate running mean of intrinsic reward
-    #         if intrinsic_reward > self.mean_intrinsic_reward:
-    #             return True
-    #         else:
-    #             return False
-    #     """
-    #     # TODO: Update mean before or after saving?
-    #     return intrinsic_reward > self.avg_intrinsic_reward.avg
 
     def rollout(self, env):
         # TODO: should replay buffer always use the forward-looking image, or
@@ -350,7 +330,7 @@ class RNDExplorer(Explorer):
                 ipdb.set_trace()
                 break
 
-            replay_buffer.append(self.get_obs(env))
+            replay_buffer.append(self.get_obs(env))  # used to train RND
             all_rollout_images += images
             all_rollout_intrinsic_rewards = np.append(all_rollout_intrinsic_rewards, intrinsic_reward)
 
@@ -367,7 +347,7 @@ class RNDExplorer(Explorer):
             # except KeyboardInterrupt:
             #     exit()
 
-        # Save images if intrinsic reward is high enough and enough steps have passed (so mean has stabilized)
+        # Use top k images to train vision task
         top_image_idxs = np.argsort(all_rollout_intrinsic_rewards)[-self.top_k:]
         for im_idx in top_image_idxs:
             self.vision_task.update(all_rollout_images[im_idx])
@@ -398,17 +378,34 @@ class RNDExplorer(Explorer):
 
 
 class RandomExplorer(Explorer):
-    def __init__(self, p_save_im, *args, **kwargs):
+    def __init__(self, rollout_horizon, top_k, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.p_save_im = p_save_im
+
+        # Random Explorer doesn't actually have any "rollout", but this is to ensure
+        # that Random Explorer saves images at the same rate as RND so we can
+        # fairly compare the two
+        self.rollout_horizon = rollout_horizon
+        self.top_k = top_k
 
     def get_action_distrib(self, env):
         # random actions with equal prob
         action_distrib = np.ones(len(self.action_space)) / len(self.action_space)
         return action_distrib
 
-    def should_train_im(self):
-        return np.random.uniform() < self.p_save_im
+    def rollout(self, env):
+        replay_buffer = [self.get_obs(env)]
+        for _ in range(self.rollout_horizon):
+            # random action
+            direction_action = np.random.choice(self.action_space)
+            self.take_action(env, direction_action)
+            replay_buffer.append(self.get_obs(env))
+
+            if not env.is_running():
+                # Env stopped??? Why?
+                ipdb.set_trace()
+                break
+
+        return replay_buffer
 
     def explore(self, env, n_steps):
         # spin around to get rid of initial "halo" around agent
@@ -419,23 +416,16 @@ class RandomExplorer(Explorer):
         step = 0
         pbar = tqdm(total=n_steps)
         while step < n_steps:
-            step += 1
-            pbar.update(1)
-            action_distrib = self.get_action_distrib(env)
-            direction_action = np.random.choice(self.action_space, p=action_distrib)
-            self.take_action(env, direction_action)
+            # NOTE: Reset Replay Buffer to only contain recently visited states
+            replay_buffer = self.rollout(env)
+            step += len(replay_buffer)
+            pbar.update(len(replay_buffer))
 
-            if not env.is_running():
-                # Env stopped??? Why?
-                ipdb.set_trace()
-                break
-
-            # Randomly pick one image with random probability
-            should_train_im = self.should_train_im()
-            if should_train_im:
-                cur_image = self.get_obs(env)
-                self.vision_task.update(cur_image)
-                self.interesting_images.append(cur_image)
+            # Draw top_k images randomly to train vision task
+            image_idxs = np.random.choice(len(replay_buffer), self.top_k)
+            for im_idx in image_idxs:
+                self.vision_task.update(replay_buffer[im_idx])
+                self.interesting_images.append(self.obs_to_im(replay_buffer[im_idx]))  # for visualization
 
         self.save_results()
 
@@ -491,9 +481,13 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     #     except KeyboardInterrupt:
     #         exit()
 
+    rollout_horizon = 16
+    top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
     use_ensemble = False
     vision_task = PretrainedVisionTask(device=DEVICE)
-    explorer = RNDExplorer(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task)
+    # explorer = RNDExplorer(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
+    #                        rollout_horizon=rollout_horizon, top_k=top_k)
+    explorer = RandomExplorer(device=DEVICE, vision_task=vision_task, rollout_horizon=rollout_horizon, top_k=top_k)
     explorer.explore(env, n_steps=length)
 
 
