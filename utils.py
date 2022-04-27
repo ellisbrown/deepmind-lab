@@ -3,7 +3,7 @@ from skimage.metrics import structural_similarity as ssim
 import cv2
 import matplotlib.pyplot as plt
 
-import nlc
+# import nlc
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -61,26 +61,26 @@ def count_diff_SSIM(img1, img2, crop_bounds_w, crop_bounds_h,
     return np.sum(thresh)
 
 
-def calc_nls_mask(img1, img2, crop_bounds_w, crop_bounds_h,
-        maxsp=200, iters=10, verbose=False):
-    img1 = img1[crop_bounds_h[0]:crop_bounds_h[1],
-                    crop_bounds_w[0]:crop_bounds_w[1]]
-    img2 = img2[crop_bounds_h[0]:crop_bounds_h[1],
-                    crop_bounds_w[0]:crop_bounds_w[1]]
-    image_seq = np.vstack([[img1], [img2]])
-    mask = nlc.nlc(image_seq, maxsp=maxsp, iters=iters, outdir='', suffix='',
-            clearBlobs=False, binTh=None, relEnergy=None,
-            redirect=False, doload=False, dosave=False)
-    if verbose:
-        fig = plt.figure()
-        cv2.imshow("New Image", img1)
-        cv2.imshow("Prev Image", img2)
-        plt.imshow(mask[1])
-        plt.title("NLS Mask for 2nd Image")
-        plt.show()
-        cv2.waitKey(1)
+# def calc_nls_mask(img1, img2, crop_bounds_w, crop_bounds_h,
+#         maxsp=200, iters=10, verbose=False):
+#     img1 = img1[crop_bounds_h[0]:crop_bounds_h[1],
+#                     crop_bounds_w[0]:crop_bounds_w[1]]
+#     img2 = img2[crop_bounds_h[0]:crop_bounds_h[1],
+#                     crop_bounds_w[0]:crop_bounds_w[1]]
+#     image_seq = np.vstack([[img1], [img2]])
+#     mask = nlc.nlc(image_seq, maxsp=maxsp, iters=iters, outdir='', suffix='',
+#             clearBlobs=False, binTh=None, relEnergy=None,
+#             redirect=False, doload=False, dosave=False)
+#     if verbose:
+#         fig = plt.figure()
+#         cv2.imshow("New Image", img1)
+#         cv2.imshow("Prev Image", img2)
+#         plt.imshow(mask[1])
+#         plt.title("NLS Mask for 2nd Image")
+#         plt.show()
+#         cv2.waitKey(1)
 
-    return mask
+#     return mask
 
 
 if __name__ == "__main__":
@@ -94,5 +94,5 @@ if __name__ == "__main__":
     # count_diff_SSIM(im2, im3, crop_bounds_w, crop_bounds_h,
     #     similarity_threshold, verbose=True)
 
-    calc_nls_mask(im1, im2, crop_bounds_w, crop_bounds_h,
-        maxsp=200, iters=10, verbose=True)
+    # calc_nls_mask(im1, im2, crop_bounds_w, crop_bounds_h,
+    #     maxsp=200, iters=10, verbose=True)
