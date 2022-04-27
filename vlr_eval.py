@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from torchvision.transforms import transforms
+import numpy as np
+import random
 from torchvision import models
 torch.set_default_dtype(torch.double)
 import argparse
@@ -21,9 +23,12 @@ apply_transforms = transforms.Compose([
 ])
 
 class ImageNetPretrainedResNet(nn.Module):
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=10, pretrained=True):
         super().__init__()
-        self.model = models.resnet18(pretrained=True)
+        torch.manual_seed(0)
+        np.random.seed(0)
+        random.seed(0)
+        self.model = models.resnet18(pretrained=pretrained)
         self.num_classes = num_classes
         self.model.fc = torch.nn.Linear(self.model.fc.in_features, self.num_classes)
         self.model = self.model.float()
@@ -41,7 +46,9 @@ class ImageNetPretrainedResNet(nn.Module):
 class RNDPretrainedResNet(nn.Module):
     def __init__(self, device, saved_model_path, num_classes=10):
         super().__init__()
-        
+        torch.manual_seed(0)
+        np.random.seed(0)
+        random.seed(0)
         self.model = models.resnet18(pretrained=False)
         in_features = self.model.fc.in_features
 
@@ -83,11 +90,11 @@ def train(args, model, train_loader, test_loader):
     # Ensure model is in correct mode and on right device
     model.train()
     model = model.to(args.device)
-    optimizer = torch.optim.Adam(model.model.fc.parameters(), lr=1e-2)
+    optimizer = torch.optim.Adam(model.model.fc.parameters(), lr=1e-3)
     loss_fn = torch.nn.CrossEntropyLoss()
     cnt = 0
     for epoch in tqdm(range(args.epochs)):
-        for batch_idx, (data, target) in tqdm(enumerate(train_loader), leave=False):
+        for batch_idx, (data, target) in tqdm(enumerate(train_loader)):
             
             # Set train mode
             model.train()
@@ -150,7 +157,9 @@ if __name__ == '__main__':
     args.device = device
 
     # Init models
-    pretrained_model_baseline = ImageNetPretrainedResNet()
+    pretrained_model_baseline_1 = ImageNetPretrainedResNet()
+    pretrained_model_baseline_2 = ImageNetPretrainedResNet(pretrained=False)
+
     random_model_baseline = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_random_model_path)
     rnd_model = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_rnd_model_path)
 
@@ -163,13 +172,17 @@ if __name__ == '__main__':
     
     
     # Train and evaluate baseline model
-    baseline_accuracy = train(args, pretrained_model_baseline, train_loader=train_loader, test_loader=test_loader)
-    print(f"Baseline accuracy: {baseline_accuracy}")
+    baseline_accuracy = train(args, pretrained_model_baseline_1, train_loader=train_loader, test_loader=test_loader)
+    print(f"Pretrained True Baseline accuracy: {baseline_accuracy}")
+
+    # Train and evaluate baseline model
+    baseline_accuracy = train(args, pretrained_model_baseline_2, train_loader=train_loader, test_loader=test_loader)
+    print(f"Pretrained False Baseline accuracy: {baseline_accuracy}")
 
     # Train and evaluate our model
     rnd_accuracy = train(args, rnd_model, train_loader=train_loader, test_loader=test_loader)
     print(f"RND accuracy: {rnd_accuracy}")
 
     # Train and evaluate baseline random model
-    rnd_accuracy = train(args, random_model_baseline, train_loader=train_loader, test_loader=test_loader)
-    print(f"Random model baseline accuracy: {rnd_accuracy}")
+    random_accuracy = train(args, random_model_baseline, train_loader=train_loader, test_loader=test_loader)
+    print(f"Random model baseline accuracy: {random_accuracy}")
