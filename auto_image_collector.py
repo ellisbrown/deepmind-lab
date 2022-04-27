@@ -91,7 +91,7 @@ def run(width, height, fps, level):
     #                 "DEBUG.CAMERA_INTERLEAVED.PLAYER_VIEW_NO_RETICLE"]
     env = deepmind_lab.Lab(level, [OBSERVATION_MODE], config=config)
 
-    img_dir = "vlr_dataset_new"
+    img_dir = "vlr_dataset_final"
 
     if not os.path.isdir(img_dir):
         os.mkdir(img_dir)
@@ -101,13 +101,14 @@ def run(width, height, fps, level):
     env_action = None
     is_done = False
     idx = 0
-    num_maps = 32 * 10
+    num_maps = 16 * 10
     image_idx = 0
+    closer_indx = 0
     while idx < num_maps:
-        if idx % 32 == 0:
-            obj_id = objects[idx // 32]
+        if idx % 16 == 0:
+            obj_id = objects[idx // 16]
             print(f"Processing Object {obj_id}")
-            pbar = tqdm(total=32)
+            pbar = tqdm(total=16)
             subdir = os.path.join(img_dir, obj_id)
             if not os.path.isdir(subdir):
                 os.mkdir(subdir)
@@ -119,24 +120,40 @@ def run(width, height, fps, level):
 
         env.step(ActionSpace['noop'], num_steps=3)
 
-        # Go to extreme left
-        env.step(ActionSpace['look_left'], num_steps=8)
-
-        # Save images from 10 different view points
-        for _ in range(16):
-            env.step(ActionSpace['look_right'], num_steps=1)
-            image = env.observations()[OBSERVATION_MODE]
-            im = Image.fromarray(image)
-            im.save(os.path.join(subdir, f"{image_idx:05d}.png"))
-            image_idx += 1
+        for z in range(3):
+            if closer_indx > 7 and z==0:
+                # Move closer
+                env.step(ActionSpace['forward'], num_steps=6)
+            image_idx = sweep_and_save_imgs(env, image_idx, subdir)
+            env.step(ActionSpace['forward'], num_steps=4)
             
         pbar.update(1)
 
         idx += 1
+        closer_indx += 1
+        closer_indx %= 16
         
         # Close pbar
-        if idx % 32 == 0 and idx > 0:
+        if idx % 16 == 0 and idx > 0:
             pbar.close()
+
+
+def sweep_and_save_imgs(env, image_idx, subdir):
+    # Go to extreme left
+    env.step(ActionSpace['look_left'], num_steps=6)
+
+    # Save images from 12 different view points
+    for _ in range(12):
+        env.step(ActionSpace['look_right'], num_steps=1)
+        image = env.observations()[OBSERVATION_MODE]
+        im = Image.fromarray(image)
+        im.save(os.path.join(subdir, f"{image_idx:05d}.png"))
+        image_idx += 1
+
+    # Reorient to original angle
+    env.step(ActionSpace['look_left'], num_steps=6)
+    return image_idx
+
             
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
@@ -147,7 +164,7 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int, default=60,
                         help='Number of frames per second')
     parser.add_argument('--level_script', type=str,
-                        default='basic_map_generator_vlr',
+                        default='final_basic_map_generator_vlr',
                         help='The environment level script to load')
 
     args = parser.parse_args()

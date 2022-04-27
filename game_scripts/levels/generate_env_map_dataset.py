@@ -25,8 +25,11 @@ def main():
     obj_loc = [n//2, n//2]
     objects = [chr(c) for c in range(ord("A"), ord("Z")+1)][:10]
     agent = "P"
-    distances = [1, 2, 3, 4]
-    base_dir = './vlr_maps'
+    distances = [1, 2]
+    base_dir = './vlr_maps_final'
+
+    if not os.path.isdir(base_dir):
+        os.mkdir(base_dir)
 
     # Create a base map
     base_map = get_base_map(n)
