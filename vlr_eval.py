@@ -2,13 +2,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+from torchvision.transforms import transforms
 from torchvision import models
-from agent_random_distill import apply_transforms
 torch.set_default_dtype(torch.double)
 import argparse
-
+from tqdm import tqdm
 import os
 os.environ["CUDA_VISIBLE_DEVICES"]="2"
+
+device = torch.device("cuda")
+im_mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
+im_std = torch.tensor([0.229, 0.224, 0.225]).to(device)
+apply_transforms = transforms.Compose([
+    transforms.CenterCrop(256),
+    transforms.Resize(256),
+    transforms.ToTensor(),
+    transforms.Normalize(im_mean, im_std),
+])
 
 class ImageNetPretrainedResNet(nn.Module):
     def __init__(self, num_classes=10):
@@ -73,11 +83,11 @@ def train(args, model, train_loader, test_loader):
     # Ensure model is in correct mode and on right device
     model.train()
     model = model.to(args.device)
-    optimizer = torch.optim.Adam(model.fc.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.model.fc.parameters(), lr=1e-2)
     loss_fn = torch.nn.CrossEntropyLoss()
     cnt = 0
-    for epoch in range(args.epochs):
-        for batch_idx, (data, target) in enumerate(train_loader):
+    for epoch in tqdm(range(args.epochs)):
+        for batch_idx, (data, target) in tqdm(enumerate(train_loader), leave=False):
             
             # Set train mode
             model.train()
@@ -98,19 +108,21 @@ def train(args, model, train_loader, test_loader):
             # Optimizer takes one step
             optimizer.step()
 
-            # Log info
+            # # Log info
             if cnt % args.log_every == 0:
                 print('Train Epoch: {} [{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                     epoch, cnt, 100. * batch_idx / len(train_loader), loss.item()))
 
-            # Validation iteration
-            if cnt % args.val_every == 0:
-                model.eval()
-                accuracy = eval_dataset(model, args.device, test_loader)
-                print(f"Test accuracy : {accuracy}")
-                model.train()
             cnt += 1
 
+        # Validation iteration
+        model.eval()
+        accuracy = eval_dataset(model, args.device, test_loader)
+        print(f"Test accuracy : {accuracy}")
+
+        # accuracy = eval_dataset(model, args.device, train_loader)
+        # print(f"Train accuracy : {accuracy}")
+        model.train()
 
     final_accuracy = eval_dataset(model, args.device, test_loader)
     print(f"Final accuracy : {final_accuracy}")
@@ -125,16 +137,17 @@ if __name__ == '__main__':
                         help='test_images_foldername')
     parser.add_argument('--saved_random_model_path', type=str, default='./experiment_data/final_random/pretrained_vision_model_step_198.pt',
                         help='saved_random_model_path')
-    parser.add_argument('--saved_rnd_model_path', type=str, default='./experiment_data/final_rnd/pretrained_vision_model_step_198.pt',
+    parser.add_argument('--saved_rnd_model_path', type=str, default='./experiment_data/final_RND/pretrained_vision_model_step_198.pt',
                         help='saved_rnd_model_path')
-    parser.add_argument('--log_every', type=int, default=1,
+    parser.add_argument('--log_every', type=int, default= 25,
                         help='Log every')
     parser.add_argument('--val_every', type=int, default=1,
                         help='Val every')
-    parser.add_argument('--epochs', type=int, default=5,
+    parser.add_argument('--epochs', type=int, default=2,
                         help='epochs')
 
     args = parser.parse_args()
+    args.device = device
 
     # Init models
     pretrained_model_baseline = ImageNetPretrainedResNet()
