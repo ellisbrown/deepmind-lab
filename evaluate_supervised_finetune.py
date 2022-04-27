@@ -25,8 +25,8 @@ def finetune_model(model, train_dataset):
         # sampler=None,
         # drop_last=True)
     
-    # TODO how many params to optimize? fc or all?
-    optimizer = torch.optim.SGD(model.parameters(), 0.01)
+    # only optimize the final fc
+    optimizer = torch.optim.SGD([t for m,t in model.named_parameters() if m[:3] == "fc."], 0.01)
 
     nepochs = 2
     for _ in range(nepochs):
@@ -93,7 +93,8 @@ def main(saved_model_path = "experiment_data/final_random/pretrained_vision_mode
     pretrained_standard_result = eval_model(ft_standard_model, eval_dataset)
     print("pretrained standard result accuracy is", pretrained_standard_result)
 
-main()
+if __name__ == "__main__":
+    main()
 
 
 
