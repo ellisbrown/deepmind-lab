@@ -1,9 +1,8 @@
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
-import cv2
 import matplotlib.pyplot as plt
 
-# import nlc
+import nlc
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -39,6 +38,7 @@ def count_diff_SSIM(img1, img2, crop_bounds_w, crop_bounds_h,
                     crop_bounds_w[0]:crop_bounds_w[1]]
 
     # convert the images to grayscale
+    import cv2  # NOTE: ONLY LOAD HERE IF YOU NEED IT BC CLASHES WITH MATPLOTLIB. See https://github.com/opencv/opencv-python/issues/386
     gray_img1 = cv2.cvtColor(raw_img1, cv2.COLOR_BGR2GRAY)
     gray_img2 = cv2.cvtColor(raw_img2, cv2.COLOR_BGR2GRAY)
 
@@ -61,26 +61,28 @@ def count_diff_SSIM(img1, img2, crop_bounds_w, crop_bounds_h,
     return np.sum(thresh)
 
 
-# def calc_nls_mask(img1, img2, crop_bounds_w, crop_bounds_h,
-#         maxsp=200, iters=10, verbose=False):
-#     img1 = img1[crop_bounds_h[0]:crop_bounds_h[1],
-#                     crop_bounds_w[0]:crop_bounds_w[1]]
-#     img2 = img2[crop_bounds_h[0]:crop_bounds_h[1],
-#                     crop_bounds_w[0]:crop_bounds_w[1]]
-#     image_seq = np.vstack([[img1], [img2]])
-#     mask = nlc.nlc(image_seq, maxsp=maxsp, iters=iters, outdir='', suffix='',
-#             clearBlobs=False, binTh=None, relEnergy=None,
-#             redirect=False, doload=False, dosave=False)
-#     if verbose:
-#         fig = plt.figure()
-#         cv2.imshow("New Image", img1)
-#         cv2.imshow("Prev Image", img2)
-#         plt.imshow(mask[1])
-#         plt.title("NLS Mask for 2nd Image")
-#         plt.show()
-#         cv2.waitKey(1)
+def calc_nls_mask(img1, img2, crop_bounds_w, crop_bounds_h,
+        maxsp=200, iters=10, verbose=False):
+    img1 = img1[crop_bounds_h[0]:crop_bounds_h[1],
+                    crop_bounds_w[0]:crop_bounds_w[1]]
+    img2 = img2[crop_bounds_h[0]:crop_bounds_h[1],
+                    crop_bounds_w[0]:crop_bounds_w[1]]
+    image_seq = np.vstack([[img1], [img2]])
+    mask = nlc.nlc(image_seq, maxsp=maxsp, iters=iters, outdir='', suffix='',
+            clearBlobs=False, binTh=None, relEnergy=None,
+            redirect=False, doload=False, dosave=False)
+    print(np.min(mask[1]), np.max(mask[1]))
+    if verbose:
+        # fig = plt.figure()
+        cv2.imshow("New Image", img1)
+        cv2.imshow("Prev Image", img2)
+        cv2.imshow("NLS Mask for 2nd Image", (255 * (mask[1] / np.min(mask[1]))).astype(np.uint8))  # 255 * (mask[1] > 0.05)
+        # plt.title("NLS Mask for 2nd Image")
+        # plt.show()
+        np.save("nls_mask.npy", mask)
+        cv2.waitKey(0)
 
-#     return mask
+    return mask
 
 
 if __name__ == "__main__":
@@ -96,3 +98,6 @@ if __name__ == "__main__":
 
     # calc_nls_mask(im1, im2, crop_bounds_w, crop_bounds_h,
     #     maxsp=200, iters=10, verbose=True)
+
+    plt.imshow(np.load("nls_mask.npy")[1])
+    plt.show()

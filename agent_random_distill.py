@@ -16,8 +16,6 @@ import torchvision.transforms as transforms
 
 import deepmind_lab
 
-import utils
-
 
 def _action(*entries):
     return np.array(entries, dtype=np.intc)
@@ -67,6 +65,10 @@ apply_transforms = transforms.Compose([
 save_im_resize = transforms.Resize(100)
 
 
+class BufferEmptyError(Exception):
+    pass
+
+
 class PretrainedVisionTask(object):
     # image contrastive: mask size
     # store feature representations
@@ -74,17 +76,24 @@ class PretrainedVisionTask(object):
     # 2. randomly sample pairs of images from entire buffer
     # objects are always spinning, so taking two images, we can use the motion
     # to get a segmentation mask and use Deepak's "Learning Features by Watching Objects Move"
-    def __init__(self, device, lr=0.001, n_epochs=10, batch_size=16, buffer_size=200):
+    # Early on RND gives bad images
+    # You sent
+    # Try low lr initial and increase throughout exploration
+    # Try using 1/4 jmagenet data during exploration fine tuning to not completely forget imagenet data
+    def __init__(self, device, lr=0.001, batch_size=16, buffer_size=90):
         self.lr = lr
-        self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         self.buffer = []
         self.buffer_idx = 0
+        self.num_updates = 0
+        self.warmup_steps = 5
 
         # NOTE: Tune ALL parameters of network, DON'T FREEZE BACKBONE
         self.model = models.resnet18(pretrained=True)
-        self.model.fc = nn.Linear(512, 512)
+        # TODO: LOWER THIS LATENT SPACE
+            # guess 2-3 values for size of RND latent space (128, 64, 256)
+        self.model.fc = nn.Linear(512, 4)
         self.model = self.model.to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
@@ -101,6 +110,18 @@ class PretrainedVisionTask(object):
             self.buffer[self.buffer_idx % self.buffer_size] = entry
         self.buffer_idx += 1
 
+    def calc_contrastive_values(self, cur_image, other_images=None):
+        if other_images is None:
+            if len(self.buffer) == 0:
+                raise BufferEmptyError("Buffer is empty!")
+
+            # NOTE: Beware of self.buffer_size, and whether you can fit this all into GPU memory
+            other_images = torch.stack(self.buffer)
+        cur_feat = self.model(cur_image.unsqueeze(0))
+        other_feats = self.model(other_images)
+        normalized_dot_prod = torch.sum(cur_feat * other_feats, dim=1) / (torch.norm(cur_feat, dim=1) * torch.norm(other_feats, dim=1))
+        return normalized_dot_prod
+
     def update(self, inp):
         """
         Perform contrastive update comparing input image with buffer. Add the input
@@ -113,13 +134,11 @@ class PretrainedVisionTask(object):
             pass
 
         else:
+            self.num_updates += 1
             buffer_entries = torch.stack(random.sample(self.buffer, self.batch_size))  # default replace=False
-            buffer_feats = self.model(buffer_entries)
-            inp_feat = self.model(inp.unsqueeze(0))
-
-            # Loss: cosine similarity, want to minimize similarity
-            loss = torch.mean(torch.sum(inp_feat * buffer_feats, dim=1))
-            # print("Contrastive loss:", loss.item())
+            normalized_dot_prod = self.calc_contrastive_values(inp, buffer_entries)
+            loss = torch.mean(normalized_dot_prod)
+            print("Contrastive loss:", loss.item())
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -152,9 +171,12 @@ class Explorer(object):
         self.num_steps_forward = 10  # num steps to move forward in a chosen direction
 
         self.all_images = []
-        self.all_action_distribs = []
-        self.all_intrinsic_reward = []
+        self.all_action_distribs_rnd = []
+        self.all_action_distribs_contrast = []
+        self.all_reward_rnd = []
+        self.all_reward_contrast = []
         self.all_actions = []
+        self.all_states = []
         self.interesting_images = []
 
     def get_obs(self, env, transform=True):
@@ -162,6 +184,9 @@ class Explorer(object):
             return apply_transforms(env.observations()[OBSERVATION_MODE]).to(self.device)
         else:
             return env.observations()[OBSERVATION_MODE]
+
+    def get_state(self, env):
+        return np.concatenate([env.observations()["DEBUG.POS.TRANS"], env.observations()["DEBUG.POS.ROT"]])
 
     @staticmethod
     def obs_to_im(obs):
@@ -211,9 +236,12 @@ class Explorer(object):
         if not os.path.exists(self.save_dir):
             os.mkdir(self.save_dir)
         np.save(f"{self.save_dir}/all_images.npy", self.all_images)
-        np.save(f"{self.save_dir}/all_action_distribs.npy", self.all_action_distribs)
-        np.save(f"{self.save_dir}/all_intrinsic_reward.npy", self.all_intrinsic_reward)
+        np.save(f"{self.save_dir}/all_action_distribs1.npy", self.all_action_distribs_rnd)
+        np.save(f"{self.save_dir}/all_action_distribs2.npy", self.all_action_distribs_contrast)
+        np.save(f"{self.save_dir}/all_intrinsic_reward1.npy", self.all_reward_rnd)
+        np.save(f"{self.save_dir}/all_intrinsic_reward2.npy", self.all_reward_contrast)
         np.save(f"{self.save_dir}/all_actions.npy", self.all_actions)
+        np.save(f"{self.save_dir}/all_states.npy", self.all_states)
         np.save(f"{self.save_dir}/interesting_images.npy", self.interesting_images)
         print("Step %d Saved to %s" % (rollout_step, self.save_dir))
 
@@ -232,8 +260,11 @@ class RNDExplorer(Explorer):
         self.top_k = top_k  # top_k / rollout_horizon = fraction of images to use for vision task
         self.lr = 1e-3
         self.n_train = 10
-        self.eps = 0.2  # p(random action)
+        self.eps1 = 0.0  # p(RND greedy)
+        self.eps2 = 1.0  # p(contrastive vision task greedy)
         self.step = 0
+        self.num_updates = 0
+        self.rnd_warmup_steps = 5
 
         # only add "interesting" images to vision task after at least 1 update of RND networks
         self.min_steps_intrinsic_reward = self.rollout_horizon
@@ -263,6 +294,7 @@ class RNDExplorer(Explorer):
 
     def update(self, batch):
         init_loss = None
+        self.num_updates += 1
         for i in range(self.n_train):
             loss = torch.nn.functional.mse_loss(self.predictor(batch), self.target(batch))
 
@@ -278,23 +310,44 @@ class RNDExplorer(Explorer):
         return init_loss, final_loss
 
     def get_action_distrib(self, env):
+        """
+        Always get action distrib, whether we actually use this to pick
+        action or not (ie: if warm start enough) is left for the caller
+
+        """
         images = self.get_surrounding_images(env)
         # print(env.observations()["DEBUG.POS.TRANS"])
         # print(env.observations()["DEBUG.POS.ROT"])
 
+        # RND distribution
         input_images = torch.stack(images).to(self.device)
-        intrinsic_reward = torch.square(self.predictor(input_images) -
+        RND_intrinsic_reward = torch.square(self.predictor(input_images) -
                                         self.target(input_images)).sum(dim=-1)
-        intrinsic_reward = intrinsic_reward.detach().cpu().numpy().flatten()
-        action_distrib = intrinsic_reward / intrinsic_reward.sum()
-        return intrinsic_reward, action_distrib, images
+        RND_intrinsic_reward = RND_intrinsic_reward.detach().cpu().numpy().flatten()
+        RND_action_distrib = np.exp(RND_intrinsic_reward) / np.sum(np.exp(RND_intrinsic_reward))
+
+        # Contrastive vision task distribution
+        try:
+            contrastive_intrinsic_reward = torch.stack([
+                -1 * torch.mean(self.vision_task.calc_contrastive_values(images[i]))
+                for i in range(len(images))
+            ])
+            contrastive_intrinsic_reward = contrastive_intrinsic_reward.detach().cpu().numpy().flatten()
+            contrastive_action_distrib = np.exp(contrastive_intrinsic_reward) / np.sum(np.exp(contrastive_intrinsic_reward))
+            print(np.array2string(contrastive_intrinsic_reward, precision=2))
+        except BufferEmptyError:
+            contrastive_intrinsic_reward = np.zeros(len(images))
+            contrastive_action_distrib = np.ones(len(images)) / len(images)
+
+        return RND_intrinsic_reward, RND_action_distrib, contrastive_intrinsic_reward, contrastive_action_distrib, images
 
     def rollout(self, env):
         # TODO: should replay buffer always use the forward-looking image, or
         #   rather pick all/random view(s) at each state?
-        replay_buffer = [self.get_obs(env)]
-        all_rollout_images = []
-        all_rollout_intrinsic_rewards = np.array([])
+        chosen_views = [self.get_obs(env)]
+        all_views = []
+        all_rnd_reward = np.array([])
+        all_contrast_reward = np.array([])
 
         # Take actions while collecting images for RND training
         for k in range(self.rollout_horizon):
@@ -305,15 +358,18 @@ class RNDExplorer(Explorer):
 
             with torch.no_grad():
                 # batch x output_feat -> batch x 1
-                intrinsic_reward, action_distrib, images = self.get_action_distrib(env)
+                rnd_reward, rnd_action_distrib, contrast_reward, contrast_action_distrib, images = self.get_action_distrib(env)
 
             # TODO: epsilon greedy? or just sample from action distrib?
-            if np.random.uniform() < self.eps:
-                # random action
-                direction_action = np.random.choice(self.action_space)
+            rand_p = np.random.uniform()
+            is_random = False
+            if rand_p < self.eps1 and self.num_updates >= self.rnd_warmup_steps:
+                direction_action = np.argmax(rnd_action_distrib)
+            elif rand_p < self.eps1 + self.eps2 and self.vision_task.num_updates >= self.vision_task.warmup_steps:
+                direction_action = np.argmax(contrast_action_distrib)
             else:
-                # greedy action
-                direction_action = np.argmax(self.action_space)
+                direction_action = np.random.randint(0, len(rnd_action_distrib))
+                is_random = True
             # direction_action = np.random.choice(self.action_space, p=action_distrib)
 
             # cur_state_again = self.obs_to_im(self.get_obs(env))
@@ -325,25 +381,45 @@ class RNDExplorer(Explorer):
             # desired_im = self.obs_to_im(images[direction_action])
             # plt.imshow(desired_im)
             # plt.show()
+            if not is_random:
+                ipdb.set_trace()
+                plt.clf()
+                plt.imshow(self.obs_to_im(self.get_obs(env)))
+                plt.show()
+                vals = self.vision_task.calc_contrastive_values(self.get_obs(env))
+                for i in range(len(vals)):
+                    plt.imshow(self.obs_to_im(self.vision_task.buffer[i]))
+                    plt.title("reward: {:.2f}".format(-1 * vals[i]))
+                    plt.show()
 
             self.take_action(env, direction_action)
             # print("Actions: ", self.action_space)
             # print("Action distrib: ", np.array2string(action_distrib, precision=2))
+
+            plt.imshow(self.obs_to_im(self.get_obs(env)))
+            plt.title("Action index: {}, is_random: {}".format(direction_action, is_random))
+            plt.draw()
+            plt.pause(0.2)
 
             if not env.is_running():
                 # Env stopped??? Why?
                 ipdb.set_trace()
                 break
 
-            replay_buffer.append(self.get_obs(env))  # used to train RND
-            all_rollout_images += images
-            all_rollout_intrinsic_rewards = np.append(all_rollout_intrinsic_rewards, intrinsic_reward)
+            chosen_views.append(self.get_obs(env))  # used to train RND
+            all_views += images
+            all_rnd_reward = np.append(all_rnd_reward, rnd_reward)
+            all_contrast_reward = np.append(all_contrast_reward, contrast_reward)
 
+            # Store agent state and action taken
             orig_images = [self.obs_to_im(obs) for obs in images]
             self.all_images.append(orig_images)
-            self.all_action_distribs.append(action_distrib)
-            self.all_intrinsic_reward.append(intrinsic_reward)
+            self.all_action_distribs_rnd.append(rnd_action_distrib)
+            self.all_action_distribs_contrast.append(contrast_action_distrib)
+            self.all_reward_rnd.append(rnd_reward)
+            self.all_reward_contrast.append(contrast_reward)
             self.all_actions.append(direction_action)
+            self.all_states.append(self.get_state(env))
 
             # try:
             #     plt.imshow(im)
@@ -352,13 +428,7 @@ class RNDExplorer(Explorer):
             # except KeyboardInterrupt:
             #     exit()
 
-        # Use top k images to train vision task
-        top_image_idxs = np.argsort(all_rollout_intrinsic_rewards)[-self.top_k:]
-        for im_idx in top_image_idxs:
-            self.vision_task.update(all_rollout_images[im_idx])
-            self.interesting_images.append(self.obs_to_im(all_rollout_images[im_idx]))  # for visualization
-
-        return replay_buffer
+        return chosen_views, all_views, all_rnd_reward, all_contrast_reward
 
     def explore(self, env, n_steps):
         # spin around to get rid of initial "halo" around agent
@@ -369,20 +439,39 @@ class RNDExplorer(Explorer):
         rollout_step = 0
         step = 0
         pbar = tqdm(total=n_steps)
+
+        # Store initial state
+        images = self.get_surrounding_images(env)
+        orig_images = [self.obs_to_im(obs) for obs in images]
+        self.all_images.append(orig_images)
+        self.all_states.append(self.get_state(env))
+
         while step < n_steps:
             # NOTE: Reset Replay Buffer to only contain recently visited states
-            replay_buffer = self.rollout(env)
-            step += len(replay_buffer)
+            chosen_views, all_views, all_rnd_reward, all_contrast_reward = self.rollout(env)
+            step += self.rollout_horizon
             rollout_step += 1
-            pbar.update(len(replay_buffer))
+            pbar.update(self.rollout_horizon)
 
             if rollout_step % self.save_freq == 0:
                 self.save_results(rollout_step)
 
             # Update Predictor Network n_train times using the same replay buffer
-            batch_states = torch.stack(replay_buffer)
+            batch_states = torch.stack(chosen_views)
             init_loss, final_loss = self.update(batch_states)
-            print("(%d) %.3f -> %.3f" % (step + 1, init_loss, final_loss))
+            print("(%d) RND %.3f -> %.3f" % (step + 1, init_loss, final_loss))
+
+            # Use top k images to train vision task
+            if self.num_updates >= self.rnd_warmup_steps:
+                top_image_idxs = np.argsort(all_rnd_reward)[-self.top_k:]
+                for im_idx in top_image_idxs:
+                    self.vision_task.update(all_views[im_idx])
+                    self.interesting_images.append(self.obs_to_im(all_views[im_idx]))  # for visualization
+
+                    plt.imshow(self.interesting_images[-1])
+                    plt.title("Interesting image %d" % len(self.interesting_images))
+                    plt.draw()
+                    plt.pause(0.2)
 
         self.save_results(rollout_step)
 
@@ -410,6 +499,13 @@ class RandomExplorer(Explorer):
             self.take_action(env, direction_action)
             replay_buffer.append(self.get_obs(env))
 
+            # Store agent's state and taken action
+            images = self.get_surrounding_images(env)
+            orig_images = [self.obs_to_im(obs) for obs in images]
+            self.all_images.append(orig_images)
+            self.all_states.append(self.get_state(env))
+            self.all_actions.append(direction_action)
+
             if not env.is_running():
                 # Env stopped??? Why?
                 ipdb.set_trace()
@@ -426,6 +522,13 @@ class RandomExplorer(Explorer):
         rollout_step = 0
         step = 0
         pbar = tqdm(total=n_steps)
+
+        # Store initial state
+        images = self.get_surrounding_images(env)
+        orig_images = [self.obs_to_im(obs) for obs in images]
+        self.all_images.append(orig_images)
+        self.all_states.append(self.get_state(env))
+
         while step < n_steps:
             # NOTE: Reset Replay Buffer to only contain recently visited states
             replay_buffer = self.rollout(env)
@@ -476,7 +579,8 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     # NOTE: RGBD_INTERLEAVED or RGBD also available, potentially train 3D visual features
     # other_states = ["DEBUG.POS.TRANS", "DEBUG.POS.ROT", "DEBUG.CAMERA_INTERLEAVED.PLAYER_VIEW",
     #                 "DEBUG.CAMERA_INTERLEAVED.PLAYER_VIEW_NO_RETICLE"]
-    env = deepmind_lab.Lab(level, [OBSERVATION_MODE], config=config)
+    # "DEBUG.CAMERA_INTERLEAVED.TOP_DOWN": unfortunately not good to use
+    env = deepmind_lab.Lab(level, [OBSERVATION_MODE, "DEBUG.POS.ROT", "DEBUG.POS.TRANS"], config=config)
     env.reset()
 
     # Empirically approximate a good action value for seeing different views
@@ -496,11 +600,11 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     #     except KeyboardInterrupt:
     #         exit()
 
-    save_freq = 30
+    save_freq = 10
     rollout_horizon = 16
     top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
     use_ensemble = False
-    vision_task = PretrainedVisionTask(device=DEVICE)
+    vision_task = PretrainedVisionTask(device=DEVICE, lr=3e-5, buffer_size=32)
     explorer = RNDExplorer(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
                            rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq)
     # explorer = RandomExplorer(device=DEVICE, vision_task=vision_task, rollout_horizon=rollout_horizon,
