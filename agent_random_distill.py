@@ -147,6 +147,52 @@ class PretrainedVisionTask(object):
         # always add to buffer
         self.buffer.append(inp)
 
+class PretrainedSegmentationVisionTask(object):
+    # image contrastive: mask size
+    # store feature representations
+    # 1. compare with entire buffer treat the entire buffer as negatives
+    # 2. randomly sample pairs of images from entire buffer
+    # objects are always spinning, so taking two images, we can use the motion
+    # to get a segmentation mask and use Deepak's "Learning Features by Watching Objects Move"
+    # Early on RND gives bad images
+    # You sent
+    # Try low lr initial and increase throughout exploration
+    # Try using 1/4 jmagenet data during exploration fine tuning to not completely forget imagenet data
+    def __init__(self, device, lr=0.001, batch_size=16, buffer_size=90):
+        self.lr = lr
+        self.batch_size = batch_size
+        self.buffer_size = buffer_size
+        self.buffer = []
+        self.buffer_idx = 0
+        self.num_updates = 0
+        self.warmup_steps = 5
+
+        # NOTE: Tune ALL parameters of network, DON'T FREEZE BACKBONE
+        self.model = models.fcn_resnet50(pretrained=True)
+        # TODO: LOWER THIS LATENT SPACE
+            # guess 2-3 values for size of RND latent space (128, 64, 256)
+        self.model = self.model.to(device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+
+    def update(self, image, segmentation):
+        """
+        Perform supervised update comparing input image with segmentation mask. 
+        TODO?: Add the input image to the buffer afterwards.
+
+        """
+
+        self.num_updates += 1
+
+        loss = torch.nn.CrossEntropyLoss()(self.model(image)["out"], segmentation)
+
+        print("Supervised loss:", loss.item())
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # TODO always add to buffer
+
 
 class Explorer(object):
     def __init__(self, device, save_freq, vision_task: PretrainedVisionTask):
