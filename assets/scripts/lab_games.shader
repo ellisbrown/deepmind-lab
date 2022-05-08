@@ -954,19 +954,16 @@ textures/map/lab_games/lg_style_01_wall_green
     {
         map textures/map/lab_games/lg_grad_bar_g.tga
         rgbgen const ( 0.00 0.15 0.25 )
-        tcMod scroll 0.50 0.00
     }
     {
         map textures/map/lab_games/lg_grad_bar_g.tga
         blendfunc add
         rgbgen const ( 0.00 0.29 0.50 )
-        tcMod scroll 0.35 0.00
     }
     {
         map textures/map/lab_games/lg_grad_bar_g.tga
         blendfunc add
         rgbgen const ( 0.00 0.58 1.00 )
-        tcMod scroll 0.80 0.00
     }
     {
         map textures/map/lab_games/lg_style_01_wall_green_d.tga
