@@ -10,9 +10,11 @@ torch.set_default_dtype(torch.double)
 import argparse
 from tqdm import tqdm
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
+# os.environ["CUDA_VISIBLE_DEVICES"]="2"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 device = torch.device("cuda")
+print(device)
 im_mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
 im_std = torch.tensor([0.229, 0.224, 0.225]).to(device)
 apply_transforms = transforms.Compose([
@@ -22,13 +24,23 @@ apply_transforms = transforms.Compose([
     transforms.Normalize(im_mean, im_std),
 ])
 
+seed = 123
+random.seed(seed)
+torch.manual_seed(seed)
+np.random.seed(seed)
+
+
 class ImageNetPretrainedResNet(nn.Module):
-    def __init__(self, num_classes=10, pretrained=True):
+    def __init__(self, num_classes=10, pretrained=True, use_resnet18=True):
         super().__init__()
         torch.manual_seed(0)
         np.random.seed(0)
         random.seed(0)
-        self.model = models.resnet18(pretrained=pretrained)
+        if use_resnet18:
+            self.model = models.resnet18(pretrained=pretrained)
+        else:
+            self.model = models.resnet50(pretrained=pretrained)
+
         self.num_classes = num_classes
         self.model.fc = torch.nn.Linear(self.model.fc.in_features, self.num_classes)
         self.model = self.model.float()
@@ -44,17 +56,30 @@ class ImageNetPretrainedResNet(nn.Module):
 
 
 class RNDPretrainedResNet(nn.Module):
-    def __init__(self, device, saved_model_path, num_classes=10):
+    def __init__(self, device, saved_model_path, num_classes=10, use_resnet18=True):
         super().__init__()
         torch.manual_seed(0)
         np.random.seed(0)
         random.seed(0)
-        self.model = models.resnet18(pretrained=False)
+        if use_resnet18:
+            self.model = models.resnet18(pretrained=False)
+        else:
+            self.model = models.resnet50(pretrained=False)
+
         in_features = self.model.fc.in_features
 
         self.model.fc = None
+
         our_model_dict = torch.load(saved_model_path, map_location=device)
-        self.model.load_state_dict(our_model_dict, strict=False)
+        if not use_resnet18:
+            keys = list(our_model_dict.keys())
+            our_model_dict2 = dict()
+            prefix = "backbone."
+            for k in keys:
+                if k.startswith(prefix):
+                    our_model_dict2[k[len(prefix):]] = our_model_dict[k]
+
+        missing, unexpected = self.model.load_state_dict(our_model_dict2, strict=False)
         
         self.num_classes = num_classes
         self.model.fc = torch.nn.Linear(in_features, self.num_classes)
@@ -77,7 +102,7 @@ def eval_dataset(model, device, test_loader):
     with torch.no_grad():
         for data, target in test_loader:
             ncount += data.shape[0]
-            data, target = data.to(device), target.cpu()
+            data, target = data.to(device).float(), target.cpu()
             output = torch.argmax(torch.nn.functional.softmax(model(data)).cpu(), dim=1)
             del data
             success += torch.sum(output == target)
@@ -100,7 +125,7 @@ def train(args, model, train_loader, test_loader):
             model.train()
 
             # Get a batch of data
-            data, target = data.to(args.device), target.to(args.device)
+            data, target = data.to(args.device).float(), target.to(args.device)
             optimizer.zero_grad()
 
             # Forward pass
@@ -146,6 +171,8 @@ if __name__ == '__main__':
                         help='saved_random_model_path')
     parser.add_argument('--saved_rnd_model_path', type=str, default='./experiment_data/final_RND/pretrained_vision_model_step_198.pt',
                         help='saved_rnd_model_path')
+    parser.add_argument('--use_resnet18', action='store_true',
+                        help='Use resnet18, else use resnet50(for image segmentation)')
     parser.add_argument('--log_every', type=int, default= 25,
                         help='Log every')
     parser.add_argument('--val_every', type=int, default=1,
@@ -157,11 +184,11 @@ if __name__ == '__main__':
     args.device = device
 
     # Init models
-    pretrained_model_baseline_1 = ImageNetPretrainedResNet()
-    pretrained_model_baseline_2 = ImageNetPretrainedResNet(pretrained=False)
+    pretrained_model_baseline_1 = ImageNetPretrainedResNet(use_resnet18=args.use_resnet18)
+    pretrained_model_baseline_2 = ImageNetPretrainedResNet(pretrained=False, use_resnet18=args.use_resnet18)
 
-    random_model_baseline = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_random_model_path)
-    rnd_model = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_rnd_model_path)
+    # random_model_baseline = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_random_model_path, use_resnet18=args.use_resnet18)
+    rnd_model = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_rnd_model_path, use_resnet18=args.use_resnet18)
 
     # Init dataset
     train_dataset = torchvision.datasets.ImageFolder(args.train_images_foldername, transform = apply_transforms)
@@ -172,17 +199,17 @@ if __name__ == '__main__':
     
     
     # Train and evaluate baseline model
-    baseline_accuracy = train(args, pretrained_model_baseline_1, train_loader=train_loader, test_loader=test_loader)
-    print(f"Pretrained True Baseline accuracy: {baseline_accuracy}")
+    # baseline_accuracy = train(args, pretrained_model_baseline_1, train_loader=train_loader, test_loader=test_loader)
+    # print(f"Pretrained True Baseline accuracy: {baseline_accuracy}")
 
     # Train and evaluate baseline model
-    baseline_accuracy = train(args, pretrained_model_baseline_2, train_loader=train_loader, test_loader=test_loader)
-    print(f"Pretrained False Baseline accuracy: {baseline_accuracy}")
+    # baseline_accuracy = train(args, pretrained_model_baseline_2, train_loader=train_loader, test_loader=test_loader)
+    # print(f"Pretrained False Baseline accuracy: {baseline_accuracy}")
 
     # Train and evaluate our model
     rnd_accuracy = train(args, rnd_model, train_loader=train_loader, test_loader=test_loader)
     print(f"RND accuracy: {rnd_accuracy}")
 
     # Train and evaluate baseline random model
-    random_accuracy = train(args, random_model_baseline, train_loader=train_loader, test_loader=test_loader)
-    print(f"Random model baseline accuracy: {random_accuracy}")
+    # random_accuracy = train(args, random_model_baseline, train_loader=train_loader, test_loader=test_loader)
+    # print(f"Random model baseline accuracy: {random_accuracy}")

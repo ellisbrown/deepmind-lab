@@ -23,13 +23,31 @@ local timeout = require 'decorators.timeout'
 local api = {}
 
 local MAP_ENTITIES = [[
-**********
-*P*F    K*
-* *      *
-*        *
-*     A  *
-**********
+************
+*P*       e*
+* *        *
+* *   a    *
+*          *
+*   d     f*
+************
 ]]
+
+
+-- **********
+-- *P*d    e*
+-- * *      *
+-- *        *
+-- *     f  *
+-- **********
+
+-- More complex map, not sure if agent handles this well though...
+-- ************
+-- *P*a*b*c  i*
+-- * * * *    *
+-- *          *
+-- * * * *    *
+-- * *d*e*f  h*
+-- ************
 
 
 
@@ -51,22 +69,28 @@ function api:init(params)
 --             I = 'hr_pencil',
 --             J = 'hr_hair_brush',
 --             K = 'hr_cow',
-                A = 'hr_pencil',
-                B = 'hr_hair_brush',
+                a = 'apple2',
+                b = 'balloon',
+                c = 'banana',
+                d = 'hr_cow',
+                e = 'hr_tv',
+                f = 'hr_pencil',
+                h = 'hr_hair_brush',
+                i = 'hr_spoon',
+
+
                 C = 'hr_apple2',
                 D = 'hr_key_lrg',
                 E = 'hr_cassette',
-                F = 'hr_cow',
                 G = 'hr_spoon',
                 H = 'hr_hammer',
                 I = 'hr_tree',
                 J = 'hr_car',
-                K = 'hr_tv',
                 L = 'hr_pincer',
                 M = 'hr_saxophone',
                 N = 'hr_hat',
                 O = 'hr_cake',
---                 P = 'hr_tennis_racket',
+--                 P = 'hr_tennis_racket',  P represents the player, cannot overwrite
                 Q = 'hr_fork',
                 R = 'hr_shoe',
                 S = 'hr_can',

@@ -16,15 +16,63 @@ from skimage.feature import hog
 from skimage import color
 from scipy.spatial import KDTree
 # from scipy.misc import imresize
-from cv2 import resize as imresize
+import cv2
 from scipy import ndimage
 # from cv2 import calcOpticalFlowFarneback, OPTFLOW_FARNEBACK_GAUSSIAN
 from scipy.signal import convolve2d
 import time
 import utils
 # import _init_paths  # noqa
-import MR
-import pyflow
+from mr_saliency import MR
+from pyflow import pyflow
+
+
+def my_accumarray(indices, vals, size, func='plus', fill_value=0):
+    """
+    Implementing python equivalent of matlab accumarray.
+    Taken from SDS repo: master/superpixel_representation.py#L36-L46
+        indices: must be a numpy array (any shape)
+        vals: numpy array of same shape as indices or a scalar
+    """
+
+    # get dictionary
+    function_name_dict = {
+        'plus': (np.add, 0.),
+        'minus': (np.subtract, 0.),
+        'times': (np.multiply, 1.),
+        'max': (np.maximum, -np.inf),
+        'min': (np.minimum, np.inf),
+        'and': (np.logical_and, True),
+        'or': (np.logical_or, False)}
+
+    if func not in function_name_dict:
+        raise KeyError('Function name not defined for accumarray')
+    if np.isscalar(vals):
+        if isinstance(indices, tuple):
+            shape = indices[0].shape
+        else:
+            shape = indices.shape
+        vals = np.tile(vals, shape)
+
+    # get the function and the default value
+    (function, value) = function_name_dict[func]
+
+    # create an array to hold things
+    output = np.ndarray(size)
+    output[:] = value
+    function.at(output, indices, vals)
+
+    # also check whether indices have been used or not
+    isthere = np.ndarray(size, 'bool')
+    istherevals = np.ones(vals.shape, 'bool')
+    (function, value) = function_name_dict['or']
+    isthere[:] = value
+    function.at(isthere, indices, istherevals)
+
+    # fill things that were not used with fill value
+    output[np.invert(isthere)] = fill_value
+    return output
+
 
 
 def superpixels(im, maxsp=200, vis=False, redirect=False):
@@ -71,10 +119,10 @@ def get_region_boxes(sp):
     sp1 = sp.reshape(-1)
     xv = xv.reshape(-1)
     yv = yv.reshape(-1)
-    spxmin = utils.my_accumarray(sp1, xv, sizeOut, 'min')
-    spymin = utils.my_accumarray(sp1, yv, sizeOut, 'min')
-    spxmax = utils.my_accumarray(sp1, xv, sizeOut, 'max')
-    spymax = utils.my_accumarray(sp1, yv, sizeOut, 'max')
+    spxmin = my_accumarray(sp1, xv, sizeOut, 'min')
+    spymin = my_accumarray(sp1, yv, sizeOut, 'min')
+    spxmax = my_accumarray(sp1, xv, sizeOut, 'max')
+    spymax = my_accumarray(sp1, yv, sizeOut, 'max')
 
     boxes = np.hstack((spxmin.reshape(-1, 1), spymin.reshape(-1, 1),
                         spxmax.reshape(-1, 1), spymax.reshape(-1, 1)))
@@ -157,8 +205,7 @@ def compute_descriptor(im, sp, spPatch=15, colBins=20, hogCells=9,
                 color.rgb2gray(imPatch), orientations=hogBins,
                 pixels_per_cell=(hogCellSize, hogCellSize),
                 cells_per_block=(int(np.sqrt(hogCells)),
-                                    int(np.sqrt(hogCells))),
-                visualise=False)
+                                    int(np.sqrt(hogCells))))
             colHist = color_hist(imPatch, colBins)
             regions[count, :] = np.hstack((
                 hogF, colHist, [boxes[j, 1] * 1. / h, boxes[j, 0] * 1. / w]))
@@ -314,7 +361,7 @@ def compute_saliency(imSeq, flowSz=100, flowBdd=12.5, flowF=3, flowWinSz=10,
 
     # decrease size for optical flow computation
     for i in range(n):
-        im[i] = imresize(imSeq[i], (flowSz, flowSz))
+        im[i] = cv2.resize(imSeq[i], (flowSz, flowSz))
 
     # compute Motion Saliency per frame
     salImSeq = np.zeros((n, flowSz, flowSz))
@@ -340,7 +387,6 @@ def compute_saliency(imSeq, flowSz=100, flowBdd=12.5, flowF=3, flowWinSz=10,
             if False:
                 odir = '/home/dpathak/local/data/trash/my_nlc/nlc_out/'
                 np.save(odir + '/np/outFlow_%d_%d.npy' % (i, i + j), flow)
-                import cv2
                 hsv = np.zeros((100, 100, 3), dtype=np.uint8)
                 hsv[:, :, 0] = 255
                 hsv[:, :, 1] = 255
@@ -416,8 +462,8 @@ def salScore2votes(salImSeq, sp):
         val1 = salImSeq[i].reshape(-1)
         sizeOut = np.max(sp1) + 1
         # assign average score of pixels to a superpixel
-        sumScore = utils.my_accumarray(sp1, val1, sizeOut, 'plus')
-        count = utils.my_accumarray(sp1, np.ones(sp1.shape), sizeOut, 'plus')
+        sumScore = my_accumarray(sp1, val1, sizeOut, 'plus')
+        count = my_accumarray(sp1, np.ones(sp1.shape), sizeOut, 'plus')
         votes[startInd:startInd + sizeOut] = sumScore / count
         startInd += sizeOut
     votes = votes[:startInd]
@@ -497,9 +543,9 @@ def remove_low_energy_blobs(maskSeq, binTh, relSize=0.6, relEnergy=None,
         if np.sum(mask) == 0:
             continue
         sp1, num = ndimage.label(mask)  # 0 in sp1 is same as 0 in mask i.e. BG
-        count = utils.my_accumarray(sp1, np.ones(sp1.shape), num + 1, 'plus')
+        count = my_accumarray(sp1, np.ones(sp1.shape), num + 1, 'plus')
         if relEnergy is not None:
-            sumScore = utils.my_accumarray(sp1, maskSeq[i], num + 1, 'plus')
+            sumScore = my_accumarray(sp1, maskSeq[i], num + 1, 'plus')
             destroyFG = sumScore[1:] < relEnergy * count[1:]
         else:
             sizeLargestBlob = np.max(count[1:])
