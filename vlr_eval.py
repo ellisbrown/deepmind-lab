@@ -6,11 +6,11 @@ from torchvision.transforms import transforms
 import numpy as np
 import random
 from torchvision import models
-torch.set_default_dtype(torch.double)
+torch.set_default_dtype(torch.float)
 import argparse
 from tqdm import tqdm
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]="2"
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 device = torch.device("cuda")
 im_mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
@@ -53,6 +53,33 @@ class RNDPretrainedResNet(nn.Module):
         in_features = self.model.fc.in_features
 
         self.model.fc = None
+        our_model_dict = torch.load(saved_model_path, map_location=device)
+        self.model.load_state_dict(our_model_dict, strict=False)
+        
+        self.num_classes = num_classes
+        self.model.fc = torch.nn.Linear(in_features, self.num_classes)
+        self.model = self.model.float()
+
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        for param in self.model.fc.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class OraclePretrainedResNet(nn.Module):
+    def __init__(self, device, saved_model_path, num_classes=10):
+        super().__init__()
+        torch.manual_seed(0)
+        np.random.seed(0)
+        random.seed(0)
+        self.model = models.resnet18(pretrained=False)
+        in_features = self.model.fc.in_features
+
+        self.model.fc = nn.Linear(in_features, 64)
         our_model_dict = torch.load(saved_model_path, map_location=device)
         self.model.load_state_dict(our_model_dict, strict=False)
         
@@ -160,8 +187,11 @@ if __name__ == '__main__':
     pretrained_model_baseline_1 = ImageNetPretrainedResNet()
     pretrained_model_baseline_2 = ImageNetPretrainedResNet(pretrained=False)
 
-    random_model_baseline = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_random_model_path)
-    rnd_model = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_rnd_model_path)
+    # random_model_baseline = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_random_model_path)
+    # rnd_model = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_rnd_model_path)
+
+    oracle_contrastive_model = OraclePretrainedResNet(device=args.device,\
+         saved_model_path="/home/nmpande/deepmind-lab/experiment_data/pretrained_oracle/pretrained_oracle_vision_model_contrastive_loss_epoch_10_batchsize_32_time_05_07_22_00_00_00.pt")
 
     # Init dataset
     train_dataset = torchvision.datasets.ImageFolder(args.train_images_foldername, transform = apply_transforms)
@@ -179,10 +209,15 @@ if __name__ == '__main__':
     baseline_accuracy = train(args, pretrained_model_baseline_2, train_loader=train_loader, test_loader=test_loader)
     print(f"Pretrained False Baseline accuracy: {baseline_accuracy}")
 
-    # Train and evaluate our model
-    rnd_accuracy = train(args, rnd_model, train_loader=train_loader, test_loader=test_loader)
-    print(f"RND accuracy: {rnd_accuracy}")
+    # # Train and evaluate our model
+    # rnd_accuracy = train(args, rnd_model, train_loader=train_loader, test_loader=test_loader)
+    # print(f"RND accuracy: {rnd_accuracy}")
 
-    # Train and evaluate baseline random model
-    random_accuracy = train(args, random_model_baseline, train_loader=train_loader, test_loader=test_loader)
-    print(f"Random model baseline accuracy: {random_accuracy}")
+    # # Train and evaluate baseline random model
+    # random_accuracy = train(args, random_model_baseline, train_loader=train_loader, test_loader=test_loader)
+    # print(f"Random model baseline accuracy: {random_accuracy}")
+
+
+    # Train and evaluate our model
+    rnd_accuracy = train(args, oracle_contrastive_model, train_loader=train_loader, test_loader=test_loader)
+    print(f"Oracle contrastive accuracy: {rnd_accuracy}")
