@@ -11,6 +11,8 @@ import ipdb
 import gc
 import cv2
 import time
+import typing as t
+import json
 
 import torch
 import torch.nn as nn
@@ -23,7 +25,8 @@ from detectron2.config import get_cfg
 import deepmind_lab
 
 from utils import *
-
+from self_sup_pretraining import contrastive_loss
+from simsiam.transform import TwoCropsTransform, GaussianBlur
 
 def _action(*entries):
     return np.array(entries, dtype=np.intc)
@@ -71,6 +74,7 @@ im_mean = torch.tensor([0.485, 0.456, 0.406]).to(DEVICE)
 im_std = torch.tensor([0.229, 0.224, 0.225]).to(DEVICE)
 apply_transforms = transforms.Compose([
             transforms.ToPILImage(),
+            transforms.Resize((IM_SIZE, IM_SIZE)),
             transforms.ToTensor(),
             transforms.Normalize(im_mean, im_std),
         ])
@@ -92,7 +96,9 @@ class ContrastiveVisionTask(object):
     # You sent
     # Try low lr initial and increase throughout exploration
     # Try using 1/4 jmagenet data during exploration fine tuning to not completely forget imagenet data
-    def __init__(self, device, lr=0.001, batch_size=8, buffer_size=90):
+    def __init__(self, device, neg_contrast, loss_type, lr=0.001, batch_size=8, buffer_size=90):
+        self.device = device
+        self.neg_contrast = neg_contrast
         self.lr = lr
         self.batch_size = batch_size
         self.buffer_size = buffer_size
@@ -101,11 +107,37 @@ class ContrastiveVisionTask(object):
         self.num_updates = 0
         self.warmup_steps = 2
 
+        self.loss_type = loss_type
+        if loss_type == "cosine":
+            # assume x and y are sufficiently different images, minimize cosine similarity between them
+            # this means curiosity = -1*cosine similarity
+            self.loss_fn = lambda x, y: torch.mean(torch.sum(x * y, dim=1) / (torch.norm(x, dim=1) * torch.norm(y, dim=1)))
+        elif loss_type == "mse":
+            self.loss_fn = torch.nn.MSELoss()
+        else:
+            raise ValueError("Unknown loss type: {}".format(loss_type))
+
+        # define random augmentations to produce two different images for positive contrast
+        if not neg_contrast:
+            self.positive_aug = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+                transforms.RandomApply([
+                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
+                    ], p=0.8),
+                    transforms.RandomGrayscale(p=0.2),
+                    transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=im_mean, std=im_std)
+            ])
+
         # NOTE: Tune ALL parameters of network, DON'T FREEZE BACKBONE
-        self.model = models.resnet18(pretrained=True)
-        self.model.fc = nn.Linear(512, 4)
+        self.model = models.resnet50(pretrained=False)
+        self.model.fc = nn.Linear(self.model.fc.in_features, 4)
         self.model = self.model.to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, factor=0.7, patience=2, verbose=True)
 
     def add_to_buffer(self, entry):
         """
@@ -120,56 +152,73 @@ class ContrastiveVisionTask(object):
             self.buffer[self.buffer_idx % self.buffer_size] = entry
         self.buffer_idx += 1
 
-    def calc_contrastive_values(self, cur_image, other_images=None):
+    def calc_contrastive_loss(self, cur_image, other_images=None):
         if other_images is None:
             if len(self.buffer) == 0:
                 raise BufferEmptyError("Buffer is empty!")
 
-            # NOTE: Beware of self.buffer_size, and whether you can fit this all into GPU memory
-            other_images = torch.stack(self.buffer)
-        cur_feat = self.model(cur_image.unsqueeze(0))
-        other_feats = self.model(other_images)
-        normalized_dot_prod = torch.sum(cur_feat * other_feats, dim=1) / (torch.norm(cur_feat, dim=1) * torch.norm(other_feats, dim=1))
-        return normalized_dot_prod
+            other_images = torch.stack(random.sample(self.buffer, min(self.batch_size, len(self.buffer))))
+        cur_feat = self.model(cur_image.unsqueeze(0).to(self.device))
+        other_feats = self.model(other_images.to(self.device))
+        return self.loss_fn(cur_feat, other_feats)
 
     def calc_curiosity(self, images):
         try:
             curiosity = torch.stack([
-                -1 * torch.mean(self.calc_contrastive_values(images[i]))
+                self.calc_contrastive_loss(images[i])
                 for i in range(len(images))
             ]).detach().cpu().numpy().flatten()
+            if self.loss_type == "cosine":
+                curiosity = -1 * curiosity
             # print(np.array2string(curiosity, precision=2))
         except BufferEmptyError:
             curiosity = np.zeros(len(images))
 
         return curiosity
 
-    def update(self, inp, ignore=None):
+    def update(self, images):
         """
         Perform contrastive update comparing input image with buffer. Add the input
         image to the buffer afterwards.
 
         """
-        # always add to buffer
-        import ipdb
-        ipdb.set_trace()  # TODO: are these batches? if so, need to separate
-        self.add_to_buffer(inp)
+        self.num_updates += 1
+        for i in range(images.shape[0]):
+            self.add_to_buffer(images[i].cpu())
 
-        # TODO: if poor results, only contrast with images collected K steps ago
+        # Rather than train directly on the input samples, store into buffer
+        # to reduce influence of correlated samples
+        # "The Challenges of Continuous Self-Supervised Learning"
         if len(self.buffer) < self.batch_size:
             # not enough data in buffer to do a batch update
             pass
 
         else:
             self.num_updates += 1
-            buffer_entries = torch.stack(random.sample(self.buffer, self.batch_size))  # default replace=False
-            normalized_dot_prod = self.calc_contrastive_values(inp, buffer_entries)
-            loss = torch.mean(normalized_dot_prod)
-            print("Contrastive loss:", loss.item())
+
+            batch_images = torch.stack(random.sample(self.buffer, self.batch_size))
+            if self.neg_contrast:
+                batch_features = self.model(batch_images.to(self.device))
+                loss = contrastive_loss(batch_features, num_sampled=self.batch_size // 2)
+                del batch_features
+                # loss = self.calc_contrastive_loss()
+            else:
+                batch_features1 = self.model(
+                    torch.stack([self.positive_aug(im) for im in batch_images]).to(self.device))
+                batch_features2 = self.model(
+                    torch.stack([self.positive_aug(im) for im in batch_images]).to(self.device))
+                loss = self.loss_fn(batch_features1, batch_features2)
+                del batch_features1, batch_features2
 
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+            self.lr_scheduler.step(loss.item())
+            print("Contrastive loss:", loss.item())
+
+            del loss, batch_images
+            torch.cuda.empty_cache()
+            gc.collect()
 
 
 class SegmentationVisionTask(object):
@@ -183,7 +232,8 @@ class SegmentationVisionTask(object):
     # You sent
     # Try low lr initial and increase throughout exploration
     # Try using 1/4 jmagenet data during exploration fine tuning to not completely forget imagenet data
-    def __init__(self, device, lr=0.001, batch_size=16, buffer_size=90):
+    def __init__(self, device, is_depth, lr=0.001, batch_size=16, buffer_size=90):
+        self.is_depth = is_depth
         self.lr = lr
         self.batch_size = batch_size
         self.buffer_size = buffer_size
@@ -192,15 +242,19 @@ class SegmentationVisionTask(object):
         self.buffer_idx = 0
         self.num_updates = 0
         self.warmup_steps = 5
-        # Segmentation model predicts logits
-        self.bce_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
+
+        if is_depth:
+            self.loss_fn = torch.nn.MSELoss(reduction='none')
+        else:
+            # Segmentation model predicts logits
+            self.loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
 
         # NOTE: Tune ALL parameters of network, DON'T FREEZE BACKBONE
-        self.model = models.segmentation.fcn_resnet50(num_classes=1)  # binary mask
-        model_path = "fcn_resnet50_coco_pretrained.pth"
-        model_weights = torch.load(model_path)
-        del model_weights["classifier.4.weight"], model_weights["classifier.4.bias"]
-        self.model.load_state_dict(model_weights, strict=False)
+        self.model = models.segmentation.fcn_resnet50(pretrained=False, num_classes=1)  # binary mask
+        # model_path = "fcn_resnet50_coco_pretrained.pth"
+        # model_weights = torch.load(model_path)
+        # del model_weights["classifier.4.weight"], model_weights["classifier.4.bias"]
+        # self.model.load_state_dict(model_weights, strict=False)
         self.model = self.model.to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, factor=0.7, patience=2, verbose=True)
@@ -248,7 +302,7 @@ class SegmentationVisionTask(object):
             batch_images = torch.stack(random.sample(self.im_buffer, self.batch_size))
             batch_masks = torch.stack(random.sample(self.mask_buffer, self.batch_size))
 
-            loss = self.bce_loss(self.calc_mask(batch_images.to(DEVICE)).cpu(), batch_masks.to(torch.float32)).mean()
+            loss = self.loss_fn(self.calc_mask(batch_images.to(DEVICE)).cpu(), batch_masks.to(torch.float32)).mean()
             print("Seg loss:", loss.item())
 
             self.optimizer.zero_grad()
@@ -264,12 +318,12 @@ class SegmentationVisionTask(object):
         # image: B x C x H x W
         # segmentation: B x H x W
         # output: B
-        curiosity = self.bce_loss(self.calc_mask(images), masks.to(torch.float32))
+        curiosity = self.loss_fn(self.calc_mask(images), masks.to(torch.float32))
         return curiosity.mean(dim=(1, 2)).detach().cpu().numpy()
 
 
 class Explorer(object):
-    def __init__(self, device, save_freq, vision_task: SegmentationVisionTask):
+    def __init__(self, device, save_freq, vision_task: t.Union[ContrastiveVisionTask, SegmentationVisionTask]):
         """
         :param device: torch.device
         :param vision_task: vision task to be trained on "interesting" images
@@ -282,6 +336,7 @@ class Explorer(object):
         now = datetime.now()
         now_str = now.strftime("%Y_%m_%d_%H:%M:%S")
         self.save_dir = "experiment_data/%s" % now_str
+        os.mkdir(self.save_dir)
 
         # [0(initial view), 1, ... STEPS_TO_FULLY_ROTATE-1(final view before returning to inital view)]
         # takes STEPS_TO_FULLY_ROTATE to full rotate, so to avoid double-counting
@@ -316,29 +371,14 @@ class Explorer(object):
         #     obs = save_im_resize(obs)
         return obs.permute(1, 2, 0).detach().cpu().numpy()
 
-    def get_image_and_mask(self, env, transform=True):
+    def get_image(self, env, transform=True):
         env.step(NOOP_ACTION, num_steps=1)  # THIS IS NECESSARY! Env doesn't render fast enough?
-        im1 = self.get_obs(env, transform=False)
-        env.step(NOOP_ACTION, num_steps=3)  # wait for N timesteps to let objects rotate
-        im2 = self.get_obs(env, transform=False)
-        thresh, diff_img = calc_SSIM_mask(im1, im2)
-        # masks = calc_nls_mask(im1, im2)
-        # show_image(im1)
-        # show_image(im2)
-        # show_image(masks[1])
-        # show_image(thresh)
-        # show_image(diff_img)
-        if transform:
-            im2 = apply_transforms(im2).to(self.device)
-
-        return im2, torch.from_numpy(thresh).to(self.device)  # H x W
+        return self.get_obs(env, transform=transform)
 
     def get_surrounding_images(self, env):
         all_images = []
-        all_masks = []
-        im, mask = self.get_image_and_mask(env)
+        im = self.get_image(env)
         all_images.append(im)
-        all_masks.append(mask)
 
         interesting_images = []
         # To verify no double-counting, pass transform=True into self.get_obs() and view each image
@@ -346,15 +386,14 @@ class Explorer(object):
         # that leaves action_space - 1 actions left to take
         for i in range(len(self.action_space) - 1):
             env.step(LOOKAROUND_ACTION)
-            im, mask = self.get_image_and_mask(env)
+            im = self.get_image(env)
             all_images.append(im)
-            all_masks.append(mask)
 
         # need 1 more action to return to initial view
         # verified by viewing current state after this action and comparing
         # to images[0]
         env.step(LOOKAROUND_ACTION)
-        return all_images, all_masks
+        return all_images
 
     def take_action(self, env, direction_action: int):
         # Re-orient in desired direction
@@ -388,14 +427,7 @@ class Explorer(object):
         raise NotImplementedError("Base class")
 
     def save_results(self, rollout_step):
-        if not os.path.exists(self.save_dir):
-            os.mkdir(self.save_dir)
-
         np.save(f"{self.save_dir}/all_images.npy", self.all_images)
-        np.save(f"{self.save_dir}/all_action_distribs1.npy", self.all_action_distribs_rnd)
-        np.save(f"{self.save_dir}/all_action_distribs2.npy", self.all_action_distribs_vision)
-        np.save(f"{self.save_dir}/all_intrinsic_reward1.npy", self.all_reward_rnd)
-        np.save(f"{self.save_dir}/all_intrinsic_reward2.npy", self.all_reward_contrast)
         np.save(f"{self.save_dir}/all_actions.npy", self.all_actions)
         np.save(f"{self.save_dir}/all_states.npy", self.all_states)
         np.save(f"{self.save_dir}/interesting_images.npy", self.interesting_images)
@@ -408,280 +440,53 @@ class Explorer(object):
         torch.save(vision_model_state_dict, f"{self.save_dir}/pretrained_vision_model_step_{rollout_step}.pt")
 
 
-class RNDExplorer(Explorer):
-    def __init__(self, use_ensemble, rollout_horizon, top_k, *args, **kwargs):
+class ExplorerV2(Explorer):
+    def __init__(self, region_method="rpn", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.use_ensemble = use_ensemble
-        self.rollout_horizon = rollout_horizon
-        self.top_k = top_k  # top_k / rollout_horizon = fraction of images to use for vision task
-        self.lr = 1e-3
-        self.n_train = 10
-        self.eps1 = 0.0  # p(RND greedy)
-        self.eps2 = 1.0  # p(contrastive vision task greedy)
-        self.step = 0
-        self.num_updates = 0
-        self.rnd_warmup_steps = 3
-        self.debug_save_freq = 3
+        self.all_bboxes = []
+        if region_method == "random":
+            self.get_regions = lambda img: get_random_regions(img)
+        elif region_method == "grid":
+            self.get_regions = None
+            pass  # don't use
+        elif region_method == "rpn":
+            cfg = get_cfg()    # obtain detectron2's default config
+            cfg.merge_from_file("rpn_config.yaml")
+            self.rpn = DefaultPredictor(cfg)  # Region Proposal Network
+            self.get_regions = lambda img: get_rpn_regions(self.rpn, img)
 
-        self.interesting_masks_gt = []
-        self.interesting_masks_pred = []
+    def take_action(self, env, ang_deg, spin_around=False):
+        if spin_around:
+            for _ in range(STEPS_TO_FULLY_ROTATE // 2):
+                env.step(LOOKAROUND_ACTION)
+            return
 
-        # only add "interesting" images to vision task after at least 1 update of RND networks
-        self.min_steps_intrinsic_reward = self.rollout_horizon
+        # Re-orient in desired direction
+        # TODO: visually verify that we perform a rotation with desired angle
+        signed_steps = int(STEPS_PER_DEG * ang_deg)
+        while signed_steps != 0:
+            action_step = np.clip(signed_steps, -MAX_ABS_STEPSIZE, MAX_ABS_STEPSIZE)
+            env.step(np.array([action_step, 0, 0, 0, 0, 0, 0], dtype=np.intc))
+            signed_steps -= action_step  # action_step < 0  =>  -action_steps > 0
 
-        # TODO: Use ensemble? predictor would minimize average error across ensemble
-        #   but seems possible certain states would have a lower bound on error
-        #   no matter how many times they are trained on
-        self.target = models.resnet18(pretrained=True).to(self.device)
-        self.predictor = models.resnet18(pretrained=True).to(self.device)
-        for param in self.predictor.parameters():
-            param.requires_grad = False
-        # NOTE: define model.fc AFTER so only fc has requires_grad=True
-        if self.use_ensemble:
-            pass
-        else:
-            self.target.fc = nn.Linear(512, 128).to(self.device)
-            self.predictor.fc = nn.Linear(512, 128).to(self.device)
-        params_to_update = []
-        for p in self.predictor.parameters():
-            if p.requires_grad == True:  # only fc params will have requires_grad=True
-                params_to_update.append(p)
+        # Take N steps forward only if already facing desired direction
+        if abs(ang_deg) < FORWARD_ANG_THRESH:
+            env.step(FORWARD_ACTION, num_steps=self.num_steps_forward)
+            env.step(NOOP_ACTION, num_steps=20)  # wait for velocity to settle to 0
 
-        for p in self.target.parameters():
-            p.requires_grad = False
-
-        self.optimizer = torch.optim.Adam(params_to_update, lr=self.lr)
-
-    def update(self, batch):
-        init_loss = None
-        self.num_updates += 1
-        for i in range(self.n_train):
-            loss = torch.nn.functional.mse_loss(self.predictor(batch), self.target(batch))
-
-            # calc gradients, update weights
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            if init_loss is None:
-                init_loss = loss.item()
-
-        final_loss = loss.item()
-        return init_loss, final_loss
-
-    def get_action_distrib(self, env):
-        """
-        Always get action distrib, whether we actually use this to pick
-        action or not (ie: if warm start enough) is left for the caller
-
-        """
-        env.step(NOOP_ACTION, num_steps=3)
-        images, masks = self.get_surrounding_images(env)
-        input_images = torch.stack(images).to(self.device)
-        input_masks = torch.stack(masks).to(self.device)
-        # print(env.observations()["DEBUG.POS.TRANS"])
-        # print(env.observations()["DEBUG.POS.ROT"])
-
-        # RND distribution
-        rnd_rewards = torch.square(self.predictor(input_images) -
-                                        self.target(input_images)).sum(dim=-1)
-        rnd_rewards = rnd_rewards.detach().cpu().numpy().flatten()
-        rnd_action_distrib = np.exp(rnd_rewards) / np.sum(np.exp(rnd_rewards))
-
-        if isinstance(self.vision_task, SegmentationVisionTask):
-            vision_rewards = self.vision_task.calc_curiosity(input_images, input_masks)
-        elif isinstance(self.vision_task, ContrastiveVisionTask):
-            vision_rewards = self.vision_task.calc_curiosity(input_images)
-        else:
-            raise ValueError("Unknown vision task")
-        vision_action_distrib = np.exp(vision_rewards) / np.sum(np.exp(vision_rewards))
-
-        return rnd_rewards, rnd_action_distrib, vision_rewards, vision_action_distrib, images, masks
-
-    def rollout(self, env):
-        # TODO: should replay buffer always use the forward-looking image, or
-        #   rather pick all/random view(s) at each state?
-        chosen_views = [self.get_obs(env)]
-        all_views = []
-        all_masks = []
-        all_rnd_reward = np.array([])
-        all_vision_reward = np.array([])
-
-        # Take actions while collecting images for RND training
-        for k in range(self.rollout_horizon):
-            self.step += 1
-            # cur_state = self.obs_to_im(self.get_obs(env))
-            # plt.imshow(cur_state)
-            # plt.show()
-
-            with torch.no_grad():
-                # batch x output_feat -> batch x 1
-                rnd_rewards, rnd_action_distrib, vision_rewards, vision_action_distrib, images, masks = (
-                    self.get_action_distrib(env))
-
-            # TODO: epsilon greedy? or just sample from action distrib?
-            rand_p = np.random.uniform()
-            is_random = False
-            if rand_p < self.eps1 and self.num_updates >= self.rnd_warmup_steps:
-                direction_action = np.argmax(rnd_action_distrib)
-            elif rand_p < self.eps1 + self.eps2 and self.vision_task.num_updates >= self.vision_task.warmup_steps:
-                direction_action = np.argmax(vision_action_distrib)
-            else:
-                direction_action = np.random.randint(0, len(rnd_action_distrib))
-                is_random = True
-            # direction_action = np.random.choice(self.action_space, p=action_distrib)
-
-            # cur_state_again = self.obs_to_im(self.get_obs(env))
-            # plt.imshow(cur_state_again)
-            # plt.show()
-
-            # print("desired:")
-            # assert len(self.action_space) == len(images)
-            # desired_im = self.obs_to_im(images[direction_action])
-            # plt.imshow(desired_im)
-            # plt.show()
-            if not is_random and self.vision_task.num_updates >= 10:
-                show = False
-                # ipdb.set_trace()
-
-                if show:
-                    images, masks = self.get_surrounding_images(env)
-                    input_images = torch.stack(images).to(self.device)
-                    input_masks = torch.stack(masks).to(self.device)
-                    vals = self.vision_task.calc_curiosity(input_images, input_masks)
-                    for i in range(len(vals)):
-                        show_image(self.obs_to_im(images[i]))
-                        show_image(masks[i], title="val: {}".format(vals[i]))
-                # for i in range(len(vals)):
-                #     plt.imshow(self.obs_to_im(self.vision_task.buffer[i]))
-                #     plt.title("reward: {:.2f}".format(-1 * vals[i]))
-                #     plt.show()
-
-            self.take_action(env, direction_action)
-            # print("Actions: ", self.action_space)
-            # print("Action distrib: ", np.array2string(action_distrib, precision=2))
-
-            # plt.imshow(self.obs_to_im(self.get_obs(env)))
-            # plt.title("Action index: {}, is_random: {}".format(direction_action, is_random))
-            # plt.draw()
-            # plt.pause(0.2)
-
-            if not env.is_running():
-                # Env stopped??? Why?
-                ipdb.set_trace()
-                break
-
-            chosen_views.append(self.get_obs(env))  # used to train RND
-            all_views += images
-            all_masks += masks
-            all_rnd_reward = np.append(all_rnd_reward, rnd_rewards)
-            all_vision_reward = np.append(all_vision_reward, vision_rewards)
-
-            # Store agent state and action taken
-            if self.num_updates % self.debug_save_freq == 0:
-                orig_images = [self.obs_to_im(obs) for obs in images]
-                self.all_images.append(orig_images)
-                self.all_action_distribs_rnd.append(rnd_action_distrib)
-                self.all_action_distribs_vision.append(vision_action_distrib)
-                self.all_reward_rnd.append(rnd_rewards)
-                self.all_reward_contrast.append(vision_rewards)
-                self.all_actions.append(direction_action)
-                self.all_states.append(self.get_state(env))
-
-            # try:
-            #     plt.imshow(im)
-            #     plt.draw()
-            #     plt.pause(0.2)
-            # except KeyboardInterrupt:
-            #     exit()
-
-        return chosen_views, all_views, all_masks, all_rnd_reward, all_vision_reward
-
-    def explore(self, env, n_steps):
-        # wait for initial "halo" around agent to disappear
-        env.step(NOOP_ACTION, num_steps=200)
-
-
-        rollout_step = 0
-        step = 0
-        pbar = tqdm(total=n_steps)
-
-        while step < n_steps:
-            # NOTE: Reset Replay Buffer to only contain recently visited states
-            chosen_views, chosen_masks, all_views, all_masks, all_rnd_reward, all_vision_reward = self.rollout(env)
-            step += self.rollout_horizon
-            rollout_step += 1
-            pbar.update(self.rollout_horizon)
-
-            if rollout_step % self.save_freq == 0:
-                self.save_results(rollout_step)
-
-            # Update Predictor Network n_train times using the same replay buffer
-            if not np.isclose(self.eps1, 0, atol=1e-6):
-                init_loss, final_loss = self.update(torch.stack(chosen_views))
-                print("(%d) RND %.3f -> %.3f" % (step + 1, init_loss, final_loss))
-
-            # Use top k images to train vision task
-            # if self.num_updates >= self.rnd_warmup_steps:  # NOTE: removed this since can be used vision task to explore using eps2
-            # top_image_idxs = np.argsort(all_rnd_reward)[-self.top_k:]
-            if isinstance(self.vision_task, ContrastiveVisionTask):
-                top_image_idxs = np.arange(len(chosen_views))
-                for im_idx in top_image_idxs:
-                    # Training only on "interesting" images
-                    self.vision_task.update(all_views[im_idx], all_masks[im_idx])
-                    self.interesting_images.append(self.obs_to_im(all_views[im_idx]))
-
-                    # plt.imshow(self.interesting_images[-1])
-                    # plt.title("Interesting image %d" % len(self.interesting_images))
-                    # plt.draw()
-                    # plt.pause(0.2)
-
-            elif isinstance(self.vision_task, SegmentationVisionTask):
-                # batch_images = torch.stack([all_views[im_idx] for im_idx in top_image_idxs])
-                # batch_masks_gt = torch.stack([all_masks[im_idx] for im_idx in top_image_idxs])
-                chosen_views = torch.stack(chosen_views)
-                chosen_masks = torch.stack(chosen_masks)
-
-                del all_views, all_masks, all_rnd_reward, all_vision_reward
-                torch.cuda.empty_cache()
-                gc.collect()
-                self.vision_task.update(chosen_views, chosen_masks)
-                del chosen_views, chosen_masks
-                torch.cuda.empty_cache()
-                gc.collect()
-                #
-                # if self.vision_task.num_updates % self.debug_save_freq == 0:
-                #     with torch.no_grad():
-                #         batch_masks_pred = torch.sigmoid(self.vision_task.calc_mask(batch_images))
-                #     for i in range(batch_masks_pred.shape[0]):
-                #         self.interesting_images.append(self.obs_to_im(batch_images[i]))
-                #         self.interesting_masks_gt.append(batch_masks_gt[i].cpu().numpy())
-                #         self.interesting_masks_pred.append(batch_masks_pred[i].cpu().numpy())
-
-        self.save_results(rollout_step)
+    def bbox_to_angle(self, bbox):
+        # horizontal FOV is 90 degrees (https://github.com/deepmind/lab/issues/232)
+        # since vertical is 90 and aspect_ratio = 512/512=1
+        # also verified in collect_images.py
+        left, top, right, bottom = bbox
+        cx = (left + right) / 2
+        return (cx - IM_SIZE/2) / (IM_SIZE/2) * 90  # if cx == W/2, ang = 0, if cx == 0, ang = -90
 
     def save_results(self, rollout_step):
         super().save_results(rollout_step)
-        np.save(f"{self.save_dir}/interesting_masks_gt.npy", self.interesting_masks_gt)
-        np.save(f"{self.save_dir}/interesting_masks_pred.npy", self.interesting_masks_pred)
+        np.save(f"{self.save_dir}/all_bboxes.npy", self.all_bboxes)
 
-class RNDExplorerPolicy(Explorer):
-    PolicyActionSpace = {
-        'look_left': _action(-142, 0, 0, 0, 0, 0, 0),  # 15 degrees
-        'look_right': _action(142, 0, 0, 0, 0, 0, 0),
-        'strafe_left': _action(0, 0, -1, 0, 0, 0, 0),
-        'strafe_right': _action(0, 0, 1, 0, 0, 0, 0),
-        'forward': _action(0, 0, 0, 1, 0, 0, 0),
-        'backward': _action(0, 0, 0, -1, 0, 0, 0),
-    }
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # Define RND policy
-
-
-class RandomExplorer(Explorer):
+class RandomExplorer(ExplorerV2):
     def __init__(self, rollout_horizon, top_k, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Random Explorer doesn't actually have any "rollout", but this is to ensure
@@ -752,55 +557,65 @@ class RandomExplorer(Explorer):
         self.save_results(rollout_step)
 
 
-class ExplorerV2(Explorer):
-    def take_action(self, env, ang_deg):
-        # Re-orient in desired direction
-        # TODO: visually verify that we perform a rotation with desired angle
-        signed_steps = int(STEPS_PER_DEG * ang_deg)
-        while signed_steps != 0:
-            action_step = np.clip(signed_steps, -MAX_ABS_STEPSIZE, MAX_ABS_STEPSIZE)
-            env.step(np.array([action_step, 0, 0, 0, 0, 0, 0], dtype=np.intc))
-            signed_steps -= action_step  # action_step < 0  =>  -action_steps > 0
+class ExplorerContrastive(ExplorerV2):
+    def __init__(self, use_rnd, use_ensemble, rollout_horizon, top_k, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_rnd = use_rnd
+        self.use_ensemble = use_ensemble
+        self.rollout_horizon = rollout_horizon
+        self.top_k = top_k  # top_k / rollout_horizon = fraction of images to use for vision task
+        self.lr = 1e-3
+        self.n_train = 5
+        self.eps1 = 0.0  # p(RND greedy)
+        self.eps2 = 1.0  # p(contrastive vision task greedy)
+        self.step = 0
+        self.num_updates = 0
+        self.rnd_warmup_steps = 3
+        self.debug_save_freq = 3
 
-        # Take N steps forward only if already facing desired direction
-        if abs(ang_deg) < FORWARD_ANG_THRESH:
-            env.step(FORWARD_ACTION, num_steps=self.num_steps_forward)
-            env.step(NOOP_ACTION, num_steps=20)  # wait for velocity to settle to 0
+        # only add "interesting" images to vision task after at least 1 update of RND networks
+        self.min_steps_intrinsic_reward = self.rollout_horizon
 
+        # TODO: Use ensemble? predictor would minimize average error across ensemble
+        #   but seems possible certain states would have a lower bound on error
+        #   no matter how many times they are trained on
+        self.target = models.resnet18(pretrained=True).to(self.device)
+        self.predictor = models.resnet18(pretrained=True).to(self.device)
+        for param in self.predictor.parameters():
+            param.requires_grad = False
+        # NOTE: define model.fc AFTER so only fc has requires_grad=True
+        if self.use_ensemble:
+            pass
+        else:
+            self.target.fc = nn.Linear(512, 128).to(self.device)
+            self.predictor.fc = nn.Linear(512, 128).to(self.device)
+        params_to_update = []
+        for p in self.predictor.parameters():
+            if p.requires_grad == True:  # only fc params will have requires_grad=True
+                params_to_update.append(p)
 
-class RNDExplorerV2(RNDExplorer, ExplorerV2):
-    def __init__(self, region_method="rpn", *args, **kwargs):
-        # ExplorerV2.__init__(self, *args, **kwargs)  # redundant, but necessary if ExplorerV2 init changes
-        RNDExplorer.__init__(self, *args, **kwargs)
-        self.debug_save_freq = 1  # only saving one view, so can afford to save more often
-        self.all_bboxes = []
+        for p in self.target.parameters():
+            p.requires_grad = False
 
-        if region_method == "random":
-            self.get_regions = lambda img: get_random_regions(img)
-        elif region_method == "grid":
-            self.get_regions = None
-            pass  # don't use
-        elif region_method == "rpn":
-            cfg = get_cfg()    # obtain detectron2's default config
-            cfg.merge_from_file("rpn_config.yaml")
-            self.rpn = DefaultPredictor(cfg)  # Region Proposal Network
-            self.get_regions = lambda img: get_rpn_regions(self.rpn, img)
+        self.optimizer = torch.optim.Adam(params_to_update, lr=self.lr)
 
-        self.im_resize = transforms.Resize((256, 256))
-        self.apply_transforms = transforms.Compose([
-            transforms.ToPILImage(),
-            self.im_resize,
-            transforms.ToTensor(),
-            transforms.Normalize(im_mean, im_std),
-        ])
+    def update_rnd(self, batch):
+        init_loss = None
+        self.num_updates += 1
+        for i in range(self.n_train):
+            loss = torch.nn.functional.mse_loss(self.predictor(batch), self.target(batch))
 
-    def bbox_to_angle(self, bbox):
-        # horizontal FOV is 90 degrees (https://github.com/deepmind/lab/issues/232)
-        # since vertical is 90 and aspect_ratio = 512/512=1
-        # also verified in collect_images.py
-        left, top, right, bottom = bbox
-        cx = (left + right) / 2
-        return (cx - IM_SIZE/2) / (IM_SIZE/2) * 90  # if cx == W/2, ang = 0, if cx == 0, ang = -90
+            # calc gradients, update weights
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            if init_loss is None:
+                init_loss = loss.item()
+
+        final_loss = loss.item()
+        print("RND %.3f -> %.3f" % (init_loss, final_loss))
+        return init_loss, final_loss
 
     def get_action_distrib(self, env):
         """
@@ -809,7 +624,8 @@ class RNDExplorerV2(RNDExplorer, ExplorerV2):
 
         """
         env.step(NOOP_ACTION, num_steps=3)
-        img_raw, mask = self.get_image_and_mask(env, transform=False)
+        img_raw = self.get_image(env, transform=False)
+        img_transformed = apply_transforms(img_raw).to(self.device)
         H, W, _ = img_raw.shape
         bboxes = self.get_regions(img_raw)
 
@@ -824,48 +640,35 @@ class RNDExplorerV2(RNDExplorer, ExplorerV2):
 
         # Calculate RND error for each box
         img_crops = []
-        mask_crops = []
-        all_rnd_curiosity = []
-        all_vision_curiosity = []
+        all_curiosity = []
         for i, bbox in enumerate(bboxes):
             left, top, right, bottom = bbox
             img_crop = img_raw[top:bottom, left:right]
-            mask_crop = mask[top:bottom, left:right]
             img_crops.append(img_crop)
-            mask_crops.append(mask_crop.cpu().numpy())
 
-            input_img_crop = self.apply_transforms(img_crop).unsqueeze(0).to(self.device)
-            input_mask_crop = self.im_resize(mask_crop.unsqueeze(0)).to(self.device)  # H x W -> 1 x H x W
+            input_img_crop = apply_transforms(img_crop).unsqueeze(0).to(self.device)
 
-            # RND distribution
-            rnd_curiosity = torch.square(self.predictor(input_img_crop) -
-                                            self.target(input_img_crop)).sum(dim=-1)
+            if self.use_rnd:
+                curiosity = torch.square(self.predictor(input_img_crop) -
+                                         self.target(input_img_crop)).sum(dim=-1)
 
-            if isinstance(self.vision_task, SegmentationVisionTask):
-                vision_curiosity = self.vision_task.calc_curiosity(input_img_crop, input_mask_crop)
-            elif isinstance(self.vision_task, ContrastiveVisionTask):
-                vision_curiosity = self.vision_task.calc_curiosity(input_img_crop)
             else:
-                raise ValueError("Unknown vision task")
+                curiosity = self.vision_task.calc_curiosity(input_img_crop)
 
-            all_rnd_curiosity.append(rnd_curiosity.item())
-            all_vision_curiosity.append(vision_curiosity.item())
+            all_curiosity.append(curiosity.item())
 
         # Get action distrib
-        all_rnd_curiosity = np.array(all_rnd_curiosity)
-        all_vision_curiosity = np.array(all_vision_curiosity)
-        rnd_action_distrib = np.exp(all_rnd_curiosity) / np.sum(np.exp(all_rnd_curiosity))
-        vision_action_distrib = np.exp(all_vision_curiosity) / np.sum(np.exp(all_vision_curiosity))
-        return all_rnd_curiosity, rnd_action_distrib, all_vision_curiosity, vision_action_distrib, self.apply_transforms(img_raw).to(self.device), mask, bboxes
+        all_curiosity = np.array(all_curiosity)
+        action_distrib = np.exp(all_curiosity) / np.sum(np.exp(all_curiosity))
+        return all_curiosity, action_distrib, img_transformed, bboxes, None
 
     def rollout(self, env):
         # TODO: should replay buffer always use the forward-looking image, or
         #   rather pick all/random view(s) at each state?
         chosen_views = []
-        chosen_masks = []
+        all_aux_info = []
         all_bboxes = []
-        all_rnd_reward = np.array([])
-        all_vision_reward = np.array([])
+        all_reward = np.array([])
 
         # Take actions while collecting images for RND training
         for k in range(self.rollout_horizon):
@@ -876,22 +679,28 @@ class RNDExplorerV2(RNDExplorer, ExplorerV2):
 
             with torch.no_grad():
                 # batch x output_feat -> batch x 1
-                rnd_rewards, rnd_action_distrib, vision_rewards, vision_action_distrib, cur_img, cur_mask, bboxes = (
-                    self.get_action_distrib(env))
+                rewards, action_distrib, cur_img, bboxes, aux_info = self.get_action_distrib(env)
 
             chosen_views.append(cur_img.cpu())
-            chosen_masks.append(cur_mask.cpu())
+            all_aux_info.append(aux_info)
             all_bboxes.append(bboxes)
 
             # TODO: epsilon greedy? or just sample from action distrib?
             rand_p = np.random.uniform()
             is_random = False
-            if rand_p < self.eps1 and self.num_updates >= self.rnd_warmup_steps:
-                region_idx = np.argmax(rnd_action_distrib)
-            elif rand_p < self.eps1 + self.eps2 and self.vision_task.num_updates >= self.vision_task.warmup_steps:
-                region_idx = np.argmax(vision_action_distrib)
+            spin_around = False   # don't do this, causes agent to keep looking back at cow
+            # if rand_p < self.eps1 and self.num_updates >= self.rnd_warmup_steps:
+            #     region_idx = np.argmax(rnd_action_distrib)
+            if rand_p < self.eps1 + self.eps2 and self.vision_task.num_updates >= self.vision_task.warmup_steps:
+                region_idx = np.argmax(action_distrib)
+
+                # Nothing interesting to see, spin around
+                # print(np.max(vision_action_distrib) - np.min(vision_action_distrib))
+                # if np.max(vision_action_distrib) - np.min(vision_action_distrib) < 0.004:
+                #     spin_around = True
+
             else:
-                region_idx = np.random.randint(0, len(rnd_action_distrib))
+                region_idx = np.random.randint(0, len(action_distrib))
                 is_random = True
             # direction_action = np.random.choice(self.action_space, p=action_distrib)
 
@@ -922,7 +731,8 @@ class RNDExplorerV2(RNDExplorer, ExplorerV2):
                 #     plt.show()
 
             direction_angle = self.bbox_to_angle(bboxes[region_idx])
-            self.take_action(env, direction_angle)
+            action = (region_idx, spin_around)
+            self.take_action(env, direction_angle, spin_around=spin_around)
             # print("Actions: ", self.action_space)
             # print("Action distrib: ", np.array2string(action_distrib, precision=2))
 
@@ -936,24 +746,11 @@ class RNDExplorerV2(RNDExplorer, ExplorerV2):
                 ipdb.set_trace()
                 break
 
-            all_rnd_reward = np.append(all_rnd_reward, rnd_rewards)
-            all_vision_reward = np.append(all_vision_reward, vision_rewards)
+            all_reward = np.append(all_reward, rewards)
 
             # Store agent state and action taken
             if self.num_updates % self.debug_save_freq == 0:
-                orig_images = self.obs_to_im(cur_img)
-                self.all_images.append(orig_images)
-                self.all_action_distribs_rnd.append(rnd_action_distrib)
-                self.all_action_distribs_vision.append(vision_action_distrib)
-                self.all_reward_rnd.append(rnd_rewards)
-                self.all_reward_contrast.append(vision_rewards)
-                self.all_actions.append(region_idx)  # Save index of bbox selected
-                self.all_bboxes.append(bboxes)
-                self.all_states.append(self.get_state(env))
-                self.interesting_masks_gt.append(cur_mask.cpu().numpy())
-                with torch.no_grad():
-                    pred_mask = torch.sigmoid(self.vision_task.calc_mask(cur_img.unsqueeze(0)))
-                self.interesting_masks_pred.append(pred_mask[0].cpu().numpy())
+                self.log_info(env, rewards, action_distrib, cur_img, bboxes, action, aux_info)
             # try:
             #     plt.imshow(im)
             #     plt.draw()
@@ -961,14 +758,173 @@ class RNDExplorerV2(RNDExplorer, ExplorerV2):
             # except KeyboardInterrupt:
             #     exit()
 
-        all_views = None
-        all_masks = None
-        return chosen_views, chosen_masks, all_views, all_masks, all_rnd_reward, all_vision_reward
+        rollout_info = dict(images=chosen_views, all_aux_info=all_aux_info)
+        return rollout_info
+
+    def log_info(self, env, rewards, action_distrib, cur_img, bboxes, action, aux_info):
+        orig_images = self.obs_to_im(cur_img)
+        self.all_images.append(orig_images)
+        if self.use_rnd:
+            self.all_action_distribs_rnd.append(action_distrib)
+            self.all_reward_rnd.append(rewards)
+        else:
+            self.all_action_distribs_vision.append(action_distrib)
+            self.all_reward_contrast.append(rewards)
+
+        self.all_actions.append(action)  # Save index of bbox selected
+        self.all_bboxes.append(bboxes)
+        self.all_states.append(self.get_state(env))
+
+    def explore(self, env, n_steps):
+        # wait for initial "halo" around agent to disappear
+        env.step(NOOP_ACTION, num_steps=200)
+        rollout_step = 0
+        step = 0
+        pbar = tqdm(total=n_steps)
+
+        while step < n_steps:
+            # NOTE: Reset Replay Buffer to only contain recently visited states
+            rollout_info = self.rollout(env)
+            step += self.rollout_horizon
+            rollout_step += 1
+            pbar.update(self.rollout_horizon)
+
+            if rollout_step % self.save_freq == 0:
+                self.save_results(rollout_step)
+
+            if self.use_rnd:
+                self.update_rnd(torch.stack(rollout_info["images"]).to(self.device))
+
+            self.update_vision_task(rollout_info)
+
+        self.save_results(rollout_step)
+
+    def update_vision_task(self, rollout_info):
+        self.vision_task.update(torch.stack(rollout_info["images"]))
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def save_results(self, rollout_step):
-        RNDExplorer.save_results(self, rollout_step)
-        # Also save bounding boxes
-        np.save(f"{self.save_dir}/all_bboxes.npy", self.all_bboxes)
+        super().save_results(rollout_step)
+        np.save(f"{self.save_dir}/all_action_distribs_rnd.npy", self.all_action_distribs_rnd)
+        np.save(f"{self.save_dir}/all_action_distribs_vision.npy", self.all_action_distribs_vision)
+        np.save(f"{self.save_dir}/all_reward_rnd.npy", self.all_reward_rnd)
+        np.save(f"{self.save_dir}/all_reward_contrast.npy", self.all_reward_contrast)
+
+
+class ExplorerMasks(ExplorerContrastive):
+    def __init__(self, is_depth, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.debug_save_freq = 1  # only saving one view, so can afford to save more often
+
+        self.resize = transforms.Resize((IM_SIZE, IM_SIZE))
+        self.is_depth = is_depth
+        if is_depth:
+            self.get_image_and_mask = self.get_image_and_depth
+        else:
+            self.get_image_and_mask = self.get_image_and_motion_mask
+
+        self.interesting_masks_gt = []
+        self.interesting_masks_pred = []
+
+    def get_image_and_motion_mask(self, env, transform=True):
+        env.step(NOOP_ACTION, num_steps=1)  # THIS IS NECESSARY! Env doesn't render fast enough?
+        im1 = self.get_obs(env, transform=False)
+        env.step(NOOP_ACTION, num_steps=3)  # wait for N timesteps to let objects rotate
+        im2 = self.get_obs(env, transform=False)
+        thresh, diff_img = calc_SSIM_mask(im1, im2)
+        # masks = calc_nls_mask(im1, im2)
+        # show_image(im1)
+        # show_image(im2)
+        # show_image(masks[1])
+        # show_image(thresh)
+        # show_image(diff_img)
+        if transform:
+            im2 = apply_transforms(im2).to(self.device)
+
+        return im2, torch.from_numpy(thresh).to(self.device)  # H x W
+
+    def get_image_and_depth(self, env, transform=True):
+        env.step(NOOP_ACTION, num_steps=1)  # THIS IS NECESSARY! Env doesn't render fast enough?
+        # im = self.get_obs(env, transform=transform)
+        assert IM_SIZE == 256  # TODO: make this work for other sizes
+        im = env.observations()[OBSERVATION_MODE][0:220, :, :]
+        im = self.resize(torch.from_numpy(im).permute(2, 0, 1))
+        if transform:
+            im = apply_transforms(im).to(self.device)
+        else:
+            im = im.permute(1, 2, 0).numpy()
+        depth = torch.from_numpy(env.observations()["RGBD_INTERLEAVED"][0:220, :, -1])
+        depth = self.resize(depth.unsqueeze(0).float()).to(self.device)[0] / 255.0
+
+        return im, depth  # H x W
+
+    def get_action_distrib(self, env):
+        """
+        Always get action distrib, whether we actually use this to pick
+        action or not (ie: if warm start enough) is left for the caller
+
+        """
+        env.step(NOOP_ACTION, num_steps=3)
+        img_raw, mask = self.get_image_and_mask(env, transform=False)
+        img_transformed = apply_transforms(img_raw).to(self.device)
+        H, W, _ = img_raw.shape
+        bboxes = self.get_regions(img_raw)
+
+        # """
+        # NOTE: I think the below is wrong...
+        # Depth not necessary to extract angle.
+        # Since pixels lie on image plane (ie: homogeneous coordinates),
+        # their coordinate is [u, v, 1] rather than [x, y, z].
+        # Can calculate theta = atan2(1, u) to get horizontal angle.
+        # """
+        # depth_img = env.observations()["RGBD_INTERLEAVED"]
+
+        # Calculate RND error for each box
+        img_crops = []
+        mask_crops = []
+        all_curiosity = []
+        for i, bbox in enumerate(bboxes):
+            left, top, right, bottom = bbox
+            img_crop = img_raw[top:bottom, left:right]
+            mask_crop = mask[top:bottom, left:right]
+            img_crops.append(img_crop)
+            mask_crops.append(mask_crop.cpu().numpy())
+
+            input_img_crop = apply_transforms(img_crop).unsqueeze(0).to(self.device)
+            input_mask_crop = self.resize(mask_crop.unsqueeze(0)).to(self.device)  # H x W -> 1 x H x W
+
+            if self.use_rnd:
+                curiosity = torch.square(self.predictor(input_img_crop) -
+                                         self.target(input_img_crop)).sum(dim=-1)
+
+            else:
+                curiosity = self.vision_task.calc_curiosity(input_img_crop, input_mask_crop)
+
+            all_curiosity.append(curiosity.item())
+
+        # Get action distrib
+        all_curiosity = np.array(all_curiosity)
+        action_distrib = np.exp(all_curiosity) / np.sum(np.exp(all_curiosity))
+        return all_curiosity, action_distrib, img_transformed, bboxes, mask.cpu()
+
+    def log_info(self, env, rewards, action_distrib, cur_img, bboxes, action, debug_info):
+        super().log_info(env, rewards, action_distrib, cur_img, bboxes, action, debug_info)
+        cur_mask = debug_info
+        self.interesting_masks_gt.append(cur_mask.cpu().numpy())
+        with torch.no_grad():
+            pred_mask = torch.sigmoid(self.vision_task.calc_mask(cur_img.unsqueeze(0)))
+        self.interesting_masks_pred.append(pred_mask[0].cpu().numpy())
+
+    def update_vision_task(self, rollout_info):
+        self.vision_task.update(torch.stack(rollout_info["images"]), torch.stack(rollout_info["all_aux_info"]))
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    def save_results(self, rollout_step):
+        super().save_results(rollout_step)
+        np.save(os.path.join(self.save_dir, "interesting_masks_gt.npy"), self.interesting_masks_gt)
+        np.save(os.path.join(self.save_dir, "interesting_masks_pred.npy"), self.interesting_masks_pred)
 
 
 def run(length, width, height, fps, level, record, demo, demofiles, video):
@@ -1026,21 +982,53 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     # save_freq = 10
     # rollout_horizon = 4
     # top_k = 2  # top_k / rollout_horizon = fraction of images to use for vision task
-    # vision_task = ContrastiveVisionTask(device=DEVICE, lr=3e-5)
 
     save_freq = 10
     rollout_horizon = 4
     top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
     batch_size = 8
-    vision_task = SegmentationVisionTask(device=DEVICE, lr=1e-3, batch_size=batch_size)
-
     use_ensemble = False
-    # explorer = RNDExplorer(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
-    #                        rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq)
-    explorer = RNDExplorerV2(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
-                           rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq)
+    use_rnd = False
+    is_contrast = True
+    is_depth = None
+    neg_contrast = None
+    contrast_loss_type = None
+
+    if is_contrast:
+        neg_contrast = False
+        contrast_loss_type = "cosine"  # mse
+        vision_task = ContrastiveVisionTask(device=DEVICE, lr=3e-5, batch_size=batch_size, neg_contrast=neg_contrast, loss_type=contrast_loss_type)
+        explorer = ExplorerContrastive(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
+                                       rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq, use_rnd=use_rnd)
+    else:
+        is_depth = True
+        vision_task = SegmentationVisionTask(device=DEVICE, lr=1e-3, batch_size=batch_size, is_depth=is_depth)
+        explorer = ExplorerMasks(use_rnd=use_rnd, device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
+                                 rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq, is_depth=is_depth)
+
+    is_random = False
+    # is_random = True
     # explorer = RandomExplorer(device=DEVICE, vision_task=vision_task, rollout_horizon=rollout_horizon,
     #                           top_k=top_k, save_freq=save_freq)
+    args = {
+        "save_freq": save_freq,
+        "rollout_horizon": rollout_horizon,
+        "top_k": top_k,
+        "batch_size": batch_size,
+        "is_depth": is_depth,
+        "use_ensemble": use_ensemble,
+        "use_rnd": use_rnd,
+        "is_contrast": is_contrast,
+        "neg_contrast": neg_contrast,
+        "is_random": is_random,
+        "contrast_loss_type": contrast_loss_type,
+    }
+
+    # save to json
+    with open(os.path.join(explorer.save_dir, "args.json"), "w") as f:
+        json.dump(args, f)
+
+    print(json.dumps(args, indent=4))
 
     explorer.explore(env, n_steps=length)
 
