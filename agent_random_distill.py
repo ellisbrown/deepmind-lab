@@ -96,7 +96,7 @@ class ContrastiveVisionTask(object):
     # You sent
     # Try low lr initial and increase throughout exploration
     # Try using 1/4 jmagenet data during exploration fine tuning to not completely forget imagenet data
-    def __init__(self, device, neg_contrast, loss_type, lr=0.001, batch_size=8, buffer_size=90):
+    def __init__(self, device, neg_contrast, loss_type, use_pretrained, lr=0.001, batch_size=8, buffer_size=90):
         self.device = device
         self.neg_contrast = neg_contrast
         self.lr = lr
@@ -133,11 +133,11 @@ class ContrastiveVisionTask(object):
             ])
 
         # NOTE: Tune ALL parameters of network, DON'T FREEZE BACKBONE
-        self.model = models.resnet50(pretrained=False)
+        self.model = models.resnet50(pretrained=use_pretrained)
         self.model.fc = nn.Linear(self.model.fc.in_features, 4)
         self.model = self.model.to(device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, factor=0.7, patience=2, verbose=True)
+        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, factor=0.5, patience=4, verbose=True)
 
     def add_to_buffer(self, entry):
         """
@@ -232,7 +232,7 @@ class SegmentationVisionTask(object):
     # You sent
     # Try low lr initial and increase throughout exploration
     # Try using 1/4 jmagenet data during exploration fine tuning to not completely forget imagenet data
-    def __init__(self, device, is_depth, lr=0.001, batch_size=16, buffer_size=90):
+    def __init__(self, device, is_depth, use_pretrained, lr=0.001, batch_size=16, buffer_size=90):
         self.is_depth = is_depth
         self.lr = lr
         self.batch_size = batch_size
@@ -250,7 +250,7 @@ class SegmentationVisionTask(object):
             self.loss_fn = torch.nn.BCEWithLogitsLoss(reduction='none')
 
         # NOTE: Tune ALL parameters of network, DON'T FREEZE BACKBONE
-        self.model = models.segmentation.fcn_resnet50(pretrained=False, num_classes=1)  # binary mask
+        self.model = models.segmentation.fcn_resnet50(pretrained=use_pretrained, num_classes=1)  # binary mask
         # model_path = "fcn_resnet50_coco_pretrained.pth"
         # model_weights = torch.load(model_path)
         # del model_weights["classifier.4.weight"], model_weights["classifier.4.bias"]
@@ -983,26 +983,30 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     # rollout_horizon = 4
     # top_k = 2  # top_k / rollout_horizon = fraction of images to use for vision task
 
+    lr = 1e-3
     save_freq = 10
     rollout_horizon = 4
     top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
     batch_size = 8
     use_ensemble = False
     use_rnd = False
-    is_contrast = True
+    is_contrast = False
     is_depth = None
     neg_contrast = None
     contrast_loss_type = None
+    use_pretrained = False
 
     if is_contrast:
-        neg_contrast = False
+        neg_contrast = True
         contrast_loss_type = "cosine"  # mse
-        vision_task = ContrastiveVisionTask(device=DEVICE, lr=3e-5, batch_size=batch_size, neg_contrast=neg_contrast, loss_type=contrast_loss_type)
+        vision_task = ContrastiveVisionTask(device=DEVICE, lr=lr, batch_size=batch_size, neg_contrast=neg_contrast,
+                                            loss_type=contrast_loss_type, use_pretrained=use_pretrained)
         explorer = ExplorerContrastive(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
                                        rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq, use_rnd=use_rnd)
     else:
-        is_depth = True
-        vision_task = SegmentationVisionTask(device=DEVICE, lr=1e-3, batch_size=batch_size, is_depth=is_depth)
+        is_depth = False
+        vision_task = SegmentationVisionTask(device=DEVICE, lr=lr, batch_size=batch_size, is_depth=is_depth,
+                                             use_pretrained=use_pretrained)
         explorer = ExplorerMasks(use_rnd=use_rnd, device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
                                  rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq, is_depth=is_depth)
 
@@ -1022,6 +1026,8 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
         "neg_contrast": neg_contrast,
         "is_random": is_random,
         "contrast_loss_type": contrast_loss_type,
+        "use_pretrained": use_pretrained,
+        "lr": lr,
     }
 
     # save to json

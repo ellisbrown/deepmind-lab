@@ -25,7 +25,7 @@ def draw_vec(pos: np.ndarray, theta_rad: float, radius: float, color: str, width
 # experiment_data/2022_05_08_17:56:22
 # depth: experiment_data/2022_05_08_23:37:42
 data_root = """
-experiment_data/poscontrast_explore_poscontrast_task
+experiment_data/motion_seg_explore_motion_seg_task_rand_init
 """
 data_root = data_root.strip()
 if not os.path.exists(f"{data_root}/extracted_images"):
