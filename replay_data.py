@@ -25,7 +25,7 @@ def draw_vec(pos: np.ndarray, theta_rad: float, radius: float, color: str, width
 # experiment_data/2022_05_08_17:56:22
 # depth: experiment_data/2022_05_08_23:37:42
 data_root = """
-experiment_data/motion_seg_explore_motion_seg_task_rand_init
+../experiment_data/random_explore_negcontrast_task
 """
 data_root = data_root.strip()
 if not os.path.exists(f"{data_root}/extracted_images"):
@@ -56,12 +56,14 @@ if not os.path.exists(f"{data_root}/extracted_images"):
 args = json.load(open(f"{data_root}/args.json"))
 print(json.dumps(args, indent=2))
 rollout_horizon = args["rollout_horizon"]
+is_random = args["is_random"]
 if args["is_contrast"]:
     masks_gt = None
     masks_pred = None
 else:
     masks_gt = np.load(f'{data_root}/interesting_masks_gt.npy', allow_pickle=True)
     masks_pred = np.load(f'{data_root}/interesting_masks_pred.npy', allow_pickle=True)
+
 
 if args["use_rnd"]:
     all_bbox_probs = np.load(f'{data_root}/all_action_distribs_rnd.npy', allow_pickle=True)
@@ -84,45 +86,50 @@ for i in range(len(all_images)):
     if i % 1 == 0:  # trained every group of 4 images so visualize every 4 training iters
         im = all_images[i]
         print("Image {}/{}".format(i, len(all_images)))
+        axes[0].set_title("Original")
         axes[0].imshow(im)
         if masks_gt is not None:
+            axes[1].set_title("Ground truth")
             axes[1].imshow(masks_gt[i])
         if masks_pred is not None:
+            axes[2].set_title("Predicted")
             h = axes[2].imshow(masks_pred[i], vmin=0, vmax=1)
             cb = f.colorbar(h)
-        bboxes = all_bboxes[i]
-        # _, spin_around = all_actions[i]
-        spin_around = False
-        bbox_probs = all_bbox_probs[i]
-        sorted_indices = np.argsort(bbox_probs)[::-1]
-        for j in range(top_boxes):
-            bbox = bboxes[sorted_indices[j]].flatten()
+
+        if not is_random:
+            bboxes = all_bboxes[i]
+            # _, spin_around = all_actions[i]
+            spin_around = False
+            bbox_probs = all_bbox_probs[i]
+            sorted_indices = np.argsort(bbox_probs)[::-1]
+            for j in range(top_boxes):
+                bbox = bboxes[sorted_indices[j]].flatten()
+                left, top, right, bot = bbox
+                prob = bbox_probs[sorted_indices[j]]
+
+                if j == 0:
+                    color = "lawngreen"
+                else:
+                    color = "red"
+
+                rect = patches.Rectangle((left, top), right-left, bot-top, linewidth=(prob * len(bboxes))**2, edgecolor=color, facecolor='none')
+                axes[0].add_patch(rect)
+
+                if masks_gt is not None:
+                    rect = patches.Rectangle((left, top), right-left, bot-top, linewidth=(prob * len(bboxes))**2, edgecolor=color, facecolor='none')
+                    axes[1].add_patch(rect)
+
+            # Show least interesting too
+            color = "cyan"
+            bbox = bboxes[sorted_indices[-1]].flatten()
             left, top, right, bot = bbox
-            prob = bbox_probs[sorted_indices[j]]
-
-            if j == 0:
-                color = "lawngreen"
-            else:
-                color = "red"
-
+            prob = bbox_probs[sorted_indices[-1]]
             rect = patches.Rectangle((left, top), right-left, bot-top, linewidth=(prob * len(bboxes))**2, edgecolor=color, facecolor='none')
             axes[0].add_patch(rect)
 
             if masks_gt is not None:
                 rect = patches.Rectangle((left, top), right-left, bot-top, linewidth=(prob * len(bboxes))**2, edgecolor=color, facecolor='none')
                 axes[1].add_patch(rect)
-
-        # Show least interesting too
-        color = "cyan"
-        bbox = bboxes[sorted_indices[-1]].flatten()
-        left, top, right, bot = bbox
-        prob = bbox_probs[sorted_indices[-1]]
-        rect = patches.Rectangle((left, top), right-left, bot-top, linewidth=(prob * len(bboxes))**2, edgecolor=color, facecolor='none')
-        axes[0].add_patch(rect)
-
-        if masks_gt is not None:
-            rect = patches.Rectangle((left, top), right-left, bot-top, linewidth=(prob * len(bboxes))**2, edgecolor=color, facecolor='none')
-            axes[1].add_patch(rect)
 
         # if spin_around:
         #     print(spin_around)
