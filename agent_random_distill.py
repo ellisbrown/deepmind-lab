@@ -208,6 +208,8 @@ class ContrastiveVisionTask(object):
                 batch_features2 = self.model(
                     torch.stack([self.positive_aug(im) for im in batch_images]).to(self.device))
                 loss = self.loss_fn(batch_features1, batch_features2)
+                if self.loss_type == "cosine":
+                    loss = -1 * loss  # want to maximize cosine similarity btwn positive pairs
                 del batch_features1, batch_features2
 
             self.optimizer.zero_grad()
@@ -486,79 +488,9 @@ class ExplorerV2(Explorer):
         super().save_results(rollout_step)
         np.save(f"{self.save_dir}/all_bboxes.npy", self.all_bboxes)
 
-class RandomExplorer(ExplorerV2):
-    def __init__(self, rollout_horizon, top_k, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Random Explorer doesn't actually have any "rollout", but this is to ensure
-        # that Random Explorer saves images at the same rate as RND so we can
-        # fairly compare the two
-        self.rollout_horizon = rollout_horizon
-        self.top_k = top_k
-
-    def get_action_distrib(self, env):
-        # random actions with equal prob
-        action_distrib = np.ones(len(self.action_space)) / len(self.action_space)
-        return action_distrib
-
-    def rollout(self, env):
-        replay_buffer = [self.get_obs(env)]
-        for _ in range(self.rollout_horizon):
-            # random action
-            direction_action = np.random.choice(self.action_space)
-            self.take_action(env, direction_action)
-            replay_buffer.append(self.get_obs(env))
-
-            # Store agent's state and taken action
-            images = self.get_surrounding_images(env)
-            orig_images = [self.obs_to_im(obs) for obs in images]
-            self.all_images.append(orig_images)
-            self.all_states.append(self.get_state(env))
-            self.all_actions.append(direction_action)
-
-            if not env.is_running():
-                # Env stopped??? Why?
-                ipdb.set_trace()
-                break
-
-        return replay_buffer
-
-    def explore(self, env, n_steps):
-        # spin around to get rid of initial "halo" around agent
-        self.get_surrounding_images(env)
-        self.get_surrounding_images(env)
-        self.get_surrounding_images(env)
-
-        rollout_step = 0
-        step = 0
-        pbar = tqdm(total=n_steps)
-
-        # Store initial state
-        images = self.get_surrounding_images(env)
-        orig_images = [self.obs_to_im(obs) for obs in images]
-        self.all_images.append(orig_images)
-        self.all_states.append(self.get_state(env))
-
-        while step < n_steps:
-            # NOTE: Reset Replay Buffer to only contain recently visited states
-            replay_buffer = self.rollout(env)
-            step += len(replay_buffer)
-            rollout_step += 1
-            pbar.update(len(replay_buffer))
-
-            if rollout_step % self.save_freq == 0:
-                self.save_results(rollout_step)
-
-            # Draw top_k images randomly to train vision task
-            image_idxs = np.random.choice(len(replay_buffer), self.top_k)
-            for im_idx in image_idxs:
-                self.vision_task.update(replay_buffer[im_idx])
-                self.interesting_images.append(self.obs_to_im(replay_buffer[im_idx]))  # for visualization
-
-        self.save_results(rollout_step)
-
 
 class ExplorerContrastive(ExplorerV2):
-    def __init__(self, use_rnd, use_ensemble, rollout_horizon, top_k, *args, **kwargs):
+    def __init__(self, use_rnd, use_ensemble, rollout_horizon, top_k, eps, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_rnd = use_rnd
         self.use_ensemble = use_ensemble
@@ -566,8 +498,8 @@ class ExplorerContrastive(ExplorerV2):
         self.top_k = top_k  # top_k / rollout_horizon = fraction of images to use for vision task
         self.lr = 1e-3
         self.n_train = 5
-        self.eps1 = 0.0  # p(RND greedy)
-        self.eps2 = 1.0  # p(contrastive vision task greedy)
+        self.eps = eps
+        self.always_random = np.isclose(self.eps, 0)
         self.step = 0
         self.num_updates = 0
         self.rnd_warmup_steps = 3
@@ -638,7 +570,7 @@ class ExplorerContrastive(ExplorerV2):
         # """
         # depth_img = env.observations()["RGBD_INTERLEAVED"]
 
-        # Calculate RND error for each box
+        # Calculate curiosity for each box
         img_crops = []
         all_curiosity = []
         for i, bbox in enumerate(bboxes):
@@ -648,10 +580,11 @@ class ExplorerContrastive(ExplorerV2):
 
             input_img_crop = apply_transforms(img_crop).unsqueeze(0).to(self.device)
 
-            if self.use_rnd:
+            if self.always_random:
+                curiosity = torch.zeros(1).to(self.device)
+            elif self.use_rnd:
                 curiosity = torch.square(self.predictor(input_img_crop) -
                                          self.target(input_img_crop)).sum(dim=-1)
-
             else:
                 curiosity = self.vision_task.calc_curiosity(input_img_crop)
 
@@ -687,11 +620,10 @@ class ExplorerContrastive(ExplorerV2):
 
             # TODO: epsilon greedy? or just sample from action distrib?
             rand_p = np.random.uniform()
-            is_random = False
             spin_around = False   # don't do this, causes agent to keep looking back at cow
             # if rand_p < self.eps1 and self.num_updates >= self.rnd_warmup_steps:
             #     region_idx = np.argmax(rnd_action_distrib)
-            if rand_p < self.eps1 + self.eps2 and self.vision_task.num_updates >= self.vision_task.warmup_steps:
+            if rand_p < self.eps and self.vision_task.num_updates >= self.vision_task.warmup_steps:
                 region_idx = np.argmax(action_distrib)
 
                 # Nothing interesting to see, spin around
@@ -701,45 +633,10 @@ class ExplorerContrastive(ExplorerV2):
 
             else:
                 region_idx = np.random.randint(0, len(action_distrib))
-                is_random = True
-            # direction_action = np.random.choice(self.action_space, p=action_distrib)
-
-            # cur_state_again = self.obs_to_im(self.get_obs(env))
-            # plt.imshow(cur_state_again)
-            # plt.show()
-
-            # print("desired:")
-            # assert len(self.action_space) == len(images)
-            # desired_im = self.obs_to_im(images[direction_action])
-            # plt.imshow(desired_im)
-            # plt.show()
-            if not is_random and self.vision_task.num_updates >= 10:
-                show = False
-                # ipdb.set_trace()
-
-                if show:
-                    images, masks = self.get_surrounding_images(env)
-                    input_images = torch.stack(images).to(self.device)
-                    input_masks = torch.stack(masks).to(self.device)
-                    vals = self.vision_task.calc_curiosity(input_images, input_masks)
-                    for i in range(len(vals)):
-                        show_image(self.obs_to_im(images[i]))
-                        show_image(masks[i], title="val: {}".format(vals[i]))
-                # for i in range(len(vals)):
-                #     plt.imshow(self.obs_to_im(self.vision_task.buffer[i]))
-                #     plt.title("reward: {:.2f}".format(-1 * vals[i]))
-                #     plt.show()
 
             direction_angle = self.bbox_to_angle(bboxes[region_idx])
             action = (region_idx, spin_around)
             self.take_action(env, direction_angle, spin_around=spin_around)
-            # print("Actions: ", self.action_space)
-            # print("Action distrib: ", np.array2string(action_distrib, precision=2))
-
-            # plt.imshow(self.obs_to_im(self.get_obs(env)))
-            # plt.title("Action index: {}, is_random: {}".format(direction_action, is_random))
-            # plt.draw()
-            # plt.pause(0.2)
 
             if not env.is_running():
                 # Env stopped??? Why?
@@ -894,10 +791,11 @@ class ExplorerMasks(ExplorerContrastive):
             input_img_crop = apply_transforms(img_crop).unsqueeze(0).to(self.device)
             input_mask_crop = self.resize(mask_crop.unsqueeze(0)).to(self.device)  # H x W -> 1 x H x W
 
-            if self.use_rnd:
+            if self.always_random:
+                curiosity = torch.zeros(1).to(self.device)
+            elif self.use_rnd:
                 curiosity = torch.square(self.predictor(input_img_crop) -
                                          self.target(input_img_crop)).sum(dim=-1)
-
             else:
                 curiosity = self.vision_task.calc_curiosity(input_img_crop, input_mask_crop)
 
@@ -988,32 +886,42 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
     rollout_horizon = 4
     top_k = 4  # top_k / rollout_horizon = fraction of images to use for vision task
     batch_size = 8
-    use_ensemble = False
-    use_rnd = False
-    is_contrast = False
-    is_depth = None
-    neg_contrast = None
-    contrast_loss_type = None
+    use_ensemble = False  # unused
+
+    # Contrastive loss
+    IS_CONTRAST = True  # picks between contrastive and pixelwise loss
+    neg_contrast = False
+    contrast_loss_type = "cosine"  # mse
+
+    # Pixel-level prediction
+    is_depth = False
+
+    # General
+    use_rnd, is_random = True, False  # NOTE: these are mutually exclusive!!!
     use_pretrained = False
 
-    if is_contrast:
-        neg_contrast = True
-        contrast_loss_type = "cosine"  # mse
+    if is_random:
+        eps = 0.0
+        use_rnd = False   # OVERWRITE SOME CONFIGS
+    else:
+        eps = 1.0
+
+    if IS_CONTRAST:
+        print("Using contrastive loss")
         vision_task = ContrastiveVisionTask(device=DEVICE, lr=lr, batch_size=batch_size, neg_contrast=neg_contrast,
                                             loss_type=contrast_loss_type, use_pretrained=use_pretrained)
+
         explorer = ExplorerContrastive(device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
-                                       rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq, use_rnd=use_rnd)
+                                       rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq,
+                                       use_rnd=use_rnd, eps=eps)
     else:
-        is_depth = False
+        print("Using pixel-level prediction")
         vision_task = SegmentationVisionTask(device=DEVICE, lr=lr, batch_size=batch_size, is_depth=is_depth,
                                              use_pretrained=use_pretrained)
         explorer = ExplorerMasks(use_rnd=use_rnd, device=DEVICE, use_ensemble=use_ensemble, vision_task=vision_task,
-                                 rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq, is_depth=is_depth)
+                                 rollout_horizon=rollout_horizon, top_k=top_k, save_freq=save_freq, is_depth=is_depth,
+                                 eps=eps)
 
-    is_random = False
-    # is_random = True
-    # explorer = RandomExplorer(device=DEVICE, vision_task=vision_task, rollout_horizon=rollout_horizon,
-    #                           top_k=top_k, save_freq=save_freq)
     args = {
         "save_freq": save_freq,
         "rollout_horizon": rollout_horizon,
@@ -1022,17 +930,18 @@ def run(length, width, height, fps, level, record, demo, demofiles, video):
         "is_depth": is_depth,
         "use_ensemble": use_ensemble,
         "use_rnd": use_rnd,
-        "is_contrast": is_contrast,
+        "is_contrast": IS_CONTRAST,
         "neg_contrast": neg_contrast,
         "is_random": is_random,
         "contrast_loss_type": contrast_loss_type,
         "use_pretrained": use_pretrained,
         "lr": lr,
+        "eps": eps,
     }
 
     # save to json
     with open(os.path.join(explorer.save_dir, "args.json"), "w") as f:
-        json.dump(args, f)
+        json.dump(args, f, indent=4)
 
     print(json.dumps(args, indent=4))
 
