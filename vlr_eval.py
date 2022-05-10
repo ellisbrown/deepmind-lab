@@ -69,6 +69,8 @@ class RNDPretrainedResNet(nn.Module):
         for k in keys:
             if k.startswith(prefix):
                 our_model_dict2[k[len(prefix):]] = our_model_dict[k]
+            else:
+                our_model_dict2[k] = our_model_dict[k]
 
         missing, unexpected = self.model.load_state_dict(our_model_dict2, strict=False)
         
@@ -173,7 +175,8 @@ def train(args, model, train_loader, test_loader):
         # print(f"Train accuracy : {accuracy}")
         model.train()
 
-    final_accuracy = eval_dataset(model, args.device, test_loader)
+    # final_accuracy = eval_dataset(model, args.device, test_loader)
+    final_accuracy = accuracy
     print(f"Final accuracy : {final_accuracy}")
     return final_accuracy
 
@@ -186,7 +189,7 @@ if __name__ == '__main__':
                         help='test_images_foldername')
     parser.add_argument('--saved_random_model_path', type=str, default='./experiment_data/final_random/pretrained_vision_model_step_198.pt',
                         help='saved_random_model_path')
-    parser.add_argument('--saved_rnd_model_path', type=str, default='./experiment_data/final_RND/pretrained_vision_model_step_198.pt',
+    parser.add_argument('--model', type=str, default='./experiment_data/final_RND/pretrained_vision_model_step_198.pt',
                         help='saved_rnd_model_path')
     parser.add_argument('--log_every', type=int, default= 25,
                         help='Log every')
@@ -202,11 +205,11 @@ if __name__ == '__main__':
     pretrained_model_baseline_1 = ImageNetPretrainedResNet()
     pretrained_model_baseline_2 = ImageNetPretrainedResNet(pretrained=False)
 
-    random_model_baseline = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_random_model_path)
-    rnd_model = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_rnd_model_path)
+    # random_model_baseline = RNDPretrainedResNet(device=args.device, saved_model_path=args.saved_random_model_path)
+    rnd_model = RNDPretrainedResNet(device=args.device, saved_model_path=args.model)
 
-    oracle_contrastive_model = OraclePretrainedResNet(device=args.device,\
-         saved_model_path="/home/nmpande/deepmind-lab/experiment_data/pretrained_oracle/pretrained_oracle_vision_model_contrastive_loss_epoch_10_batchsize_32_time_05_07_22_00_00_00.pt")
+    # oracle_contrastive_model = OraclePretrainedResNet(device=args.device,\
+    #      saved_model_path="/home/nmpande/deepmind-lab/experiment_data/pretrained_oracle/pretrained_oracle_vision_model_contrastive_loss_epoch_10_batchsize_32_time_05_07_22_00_00_00.pt")
 
     # Init dataset
     train_dataset = torchvision.datasets.ImageFolder(args.train_images_foldername, transform = apply_transforms)
@@ -217,12 +220,12 @@ if __name__ == '__main__':
     
     
     # Train and evaluate baseline model
-    baseline_accuracy = train(args, pretrained_model_baseline_1, train_loader=train_loader, test_loader=test_loader)
-    print(f"Pretrained True Baseline accuracy: {baseline_accuracy}")
+    # baseline_accuracy = train(args, pretrained_model_baseline_1, train_loader=train_loader, test_loader=test_loader)
+    # print(f"Pretrained True Baseline accuracy: {baseline_accuracy}")
 
     # Train and evaluate baseline model
-    baseline_accuracy = train(args, pretrained_model_baseline_2, train_loader=train_loader, test_loader=test_loader)
-    print(f"Pretrained False Baseline accuracy: {baseline_accuracy}")
+    # baseline_accuracy = train(args, pretrained_model_baseline_2, train_loader=train_loader, test_loader=test_loader)
+    # print(f"Pretrained False Baseline accuracy: {baseline_accuracy}")
 
     # Train and evaluate our model
     rnd_accuracy = train(args, rnd_model, train_loader=train_loader, test_loader=test_loader)
@@ -233,5 +236,5 @@ if __name__ == '__main__':
     # print(f"Random model baseline accuracy: {random_accuracy}")
 
     # Train and evaluate our model
-    rnd_accuracy = train(args, oracle_contrastive_model, train_loader=train_loader, test_loader=test_loader)
-    print(f"O
+    # rnd_accuracy = train(args, oracle_contrastive_model, train_loader=train_loader, test_loader=test_loader)
+    # print(f"Oracle contrastive model accuracy: {rnd_accuracy}")
